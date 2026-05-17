@@ -198,6 +198,7 @@ static bool parse_envelope(const uint8_t *data, size_t len,
         int field = tag >> 3, wt = tag & 7;
         if (field == 1 && wt == 2) {
             uint64_t sz; if (!pb_varint(p, end, sz)) return false;
+            if (sz > (uint64_t)(end - p)) return false;
             pkt_out = p; pkt_len = sz; p += sz;
         } else { pb_skip(p, end, wt); }
     }
@@ -217,6 +218,7 @@ static bool parse_packet(const uint8_t *data, size_t len,
         else if (field == 6 && wt == 5) pb_fixed32(p, end, pkt_id);
         else if (field == 8 && wt == 2) {
             uint64_t sz; if (!pb_varint(p, end, sz)) return false;
+            if (sz > (uint64_t)(end - p)) return false;
             enc = p; enc_len = sz; p += sz;
         } else { pb_skip(p, end, wt); }
     }
@@ -236,6 +238,7 @@ static bool parse_data(const uint8_t *data, size_t len,
             uint64_t v; if (!pb_varint(p, end, v)) return false; portnum = v;
         } else if (field == 2 && wt == 2) {
             uint64_t sz; if (!pb_varint(p, end, sz)) return false;
+            if (sz > (uint64_t)(end - p)) return false;
             payload = p; payload_len = sz; p += sz;
         } else { pb_skip(p, end, wt); }
     }
@@ -250,6 +253,7 @@ static bool parse_short_name(const uint8_t *data, size_t len, char *out) {
         int field = tag >> 3, wt = tag & 7;
         if (field == 3 && wt == 2) {
             uint64_t sz; if (!pb_varint(p, end, sz)) return false;
+            if (sz > (uint64_t)(end - p)) return false;
             size_t n = min((size_t)sz, (size_t)4);
             memcpy(out, p, n); out[n] = 0;
             return true;
