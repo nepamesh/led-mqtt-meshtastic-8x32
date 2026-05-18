@@ -352,6 +352,30 @@ static void mqtt_connect() {
 }
 
 // ============================================================
+// Boot LED test — red, blue, green snake along the strip
+// ============================================================
+static void boot_test() {
+    const CRGB colors[3] = { CRGB::Red, CRGB::Blue, CRGB::Green };
+    const int TAIL = 10;
+
+    for (int c = 0; c < 3; c++) {
+        for (int i = 0; i < NUM_LEDS + TAIL; i++) {
+            FastLED.clear();
+            for (int t = 0; t < TAIL; t++) {
+                int idx = i - t;
+                if (idx >= 0 && idx < NUM_LEDS) {
+                    leds[idx] = colors[c];
+                    leds[idx].nscale8(255 - (t * 255 / TAIL));
+                }
+            }
+            FastLED.show();
+            delay(8);
+        }
+    }
+    FastLED.clear(true);
+}
+
+// ============================================================
 // setup / loop
 // ============================================================
 void setup() {
@@ -360,6 +384,8 @@ void setup() {
     FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
     FastLED.setBrightness(BRIGHTNESS);
     FastLED.clear(true);
+
+    boot_test();
 
     wifi_connect();
 
