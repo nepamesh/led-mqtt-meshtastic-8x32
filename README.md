@@ -245,9 +245,11 @@ Below that, change any of these without recompiling or reflashing:
 |---------|--------|
 | **WiFi** | SSID, Password |
 | **MQTT** | Host (IP), Port, User, Password, Subscription topic |
-| **Display** | Connector side, Flip Y, Brightness, Scroll speed (ms), Message repeat count |
+| **Display** | Connector side, Flip Y, Brightness, Scroll speed (ms), Message repeat count, Text color |
 
 Hit **Save & Restart** and the device reboots with the new settings stored in flash. They survive power cycles.
+
+**Text color** uses a standard color picker — choose any color for the scrolling text. Default is green (`#00c800`). Note that very dark colors may be hard to read at lower brightness levels.
 
 ### Log (`/log`)
 
