@@ -63,6 +63,9 @@ static bool     s_flip_y         = MATRIX_FLIP_Y;
 static uint8_t  s_brightness     = BRIGHTNESS;
 static uint16_t s_scroll_ms      = SCROLL_MS;
 static uint8_t  s_repeat_count   = 3;
+static uint8_t  s_led_r          = 0;
+static uint8_t  s_led_g          = 200;
+static uint8_t  s_led_b          = 0;
 
 static void load_settings() {
     s_prefs.begin("nepamesh", true);
@@ -78,6 +81,9 @@ static void load_settings() {
     s_brightness   = s_prefs.getUChar("d_br",  s_brightness);
     s_scroll_ms    = s_prefs.getUShort("d_sm", s_scroll_ms);
     s_repeat_count = s_prefs.getUChar("d_rep", s_repeat_count);
+    s_led_r        = s_prefs.getUChar("d_lr",  s_led_r);
+    s_led_g        = s_prefs.getUChar("d_lg",  s_led_g);
+    s_led_b        = s_prefs.getUChar("d_lb",  s_led_b);
     s_prefs.end();
 }
 
@@ -95,6 +101,9 @@ static void save_settings() {
     s_prefs.putUChar("d_br",     s_brightness);
     s_prefs.putUShort("d_sm",    s_scroll_ms);
     s_prefs.putUChar("d_rep",    s_repeat_count);
+    s_prefs.putUChar("d_lr",     s_led_r);
+    s_prefs.putUChar("d_lg",     s_led_g);
+    s_prefs.putUChar("d_lb",     s_led_b);
     s_prefs.end();
 }
 
@@ -147,7 +156,7 @@ static int render_text(const char *text, uint8_t *buf, int max_cols) {
 static void start_scroll(const char *text) {
     ulog("[DISP] scroll: %s\n", text);
     s_width   = render_text(text, s_buf, SCROLL_BUF_COLS);
-    s_pos     = 0;
+    s_pos     = -MATRIX_W;
     s_active  = true;
     s_last_ms = millis();
 }
@@ -159,11 +168,11 @@ static void update_display() {
 
     for (int x = 0; x < MATRIX_W; x++) {
         int src = s_pos + x;
-        uint8_t col_bits = (src < s_width) ? s_buf[src] : 0;
+        uint8_t col_bits = (src >= 0 && src < s_width) ? s_buf[src] : 0;
         for (int y = 0; y < MATRIX_H; y++) {
             uint16_t idx = XY(x, y);
             if (idx < NUM_LEDS)
-                leds[idx] = (col_bits & (1 << y)) ? CRGB(0, 200, 0) : CRGB::Black;
+                leds[idx] = (col_bits & (1 << y)) ? CRGB(s_led_r, s_led_g, s_led_b) : CRGB::Black;
         }
     }
     FastLED.show();
@@ -557,6 +566,9 @@ static void handle_root() {
     sf("<label>Brightness (1-255)<input name='br' type='number' min='1' max='255' value='%u'></label>", s_brightness);
     sf("<label>Scroll speed ms<input name='sm' type='number' min='10' max='500' value='%u'></label>", s_scroll_ms);
     sf("<label>Message repeat count<input name='rc' type='number' min='1' max='10' value='%u'></label>", s_repeat_count);
+    char hex[8];
+    snprintf(hex, sizeof(hex), "#%02x%02x%02x", s_led_r, s_led_g, s_led_b);
+    sf("<label>Text color<input name='col' type='color' value='%s'></label>", hex);
     s_web.sendContent("</div>");
 
     s_web.sendContent("<button type='submit'>Save &amp; Restart</button></form></body></html>");
@@ -575,6 +587,14 @@ static void handle_save() {
     if (s_web.hasArg("br"))  s_brightness = s_web.arg("br").toInt();
     if (s_web.hasArg("sm"))  s_scroll_ms    = s_web.arg("sm").toInt();
     if (s_web.hasArg("rc"))  s_repeat_count = s_web.arg("rc").toInt();
+    if (s_web.hasArg("col")) {
+        String h = s_web.arg("col");
+        if (h.length() == 7 && h[0] == '#') {
+            s_led_r = strtol(h.substring(1, 3).c_str(), nullptr, 16);
+            s_led_g = strtol(h.substring(3, 5).c_str(), nullptr, 16);
+            s_led_b = strtol(h.substring(5, 7).c_str(), nullptr, 16);
+        }
+    }
     save_settings();
     s_web.send(200, "text/html",
         "<html><body><h2>Saved. Restarting...</h2>"
