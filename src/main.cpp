@@ -69,6 +69,8 @@ static uint8_t  s_led_g          = 200;
 static uint8_t  s_led_b          = 0;
 static int8_t   s_utc_offset     = 0;
 static char     s_hourly_msg[128] = {};
+static uint8_t  s_msg_interval   = 60;   // minutes between custom message (0 = off)
+static uint8_t  s_date_interval  = 10;   // minutes between date display  (0 = off)
 
 static void load_settings() {
     s_prefs.begin("nepamesh", true);
@@ -87,8 +89,10 @@ static void load_settings() {
     s_led_r        = s_prefs.getUChar("d_lr",  s_led_r);
     s_led_g        = s_prefs.getUChar("d_lg",  s_led_g);
     s_led_b        = s_prefs.getUChar("d_lb",  s_led_b);
-    s_utc_offset   = (int8_t)s_prefs.getChar("d_tz",  s_utc_offset);
+    s_utc_offset     = (int8_t)s_prefs.getChar("d_tz",   s_utc_offset);
     s_prefs.getString("hourly_msg", s_hourly_msg, sizeof(s_hourly_msg));
+    s_msg_interval   = s_prefs.getUChar("m_iv",  s_msg_interval);
+    s_date_interval  = s_prefs.getUChar("d_iv",  s_date_interval);
     s_prefs.end();
 }
 
@@ -109,8 +113,10 @@ static void save_settings() {
     s_prefs.putUChar("d_lr",     s_led_r);
     s_prefs.putUChar("d_lg",     s_led_g);
     s_prefs.putUChar("d_lb",     s_led_b);
-    s_prefs.putChar("d_tz",      s_utc_offset);
+    s_prefs.putChar("d_tz",         s_utc_offset);
     s_prefs.putString("hourly_msg", s_hourly_msg);
+    s_prefs.putUChar("m_iv",        s_msg_interval);
+    s_prefs.putUChar("d_iv",        s_date_interval);
     s_prefs.end();
 }
 
@@ -257,7 +263,6 @@ static void show_static(const char *text) {
 }
 
 static uint8_t  s_last_clock_min = 255;
-static uint8_t  s_last_hour_seen = 255;
 static uint32_t s_last_clock_ms  = 0;
 
 static void update_clock() {
@@ -278,10 +283,12 @@ static void update_clock() {
     time_t local_now = now + (long)s_utc_offset * 3600;
     struct tm t; gmtime_r(&local_now, &t);
 
-    // Hourly message at top of each hour
-    if ((uint8_t)t.tm_hour != s_last_hour_seen) {
-        s_last_hour_seen = t.tm_hour;
-        if (t.tm_min == 0 && s_hourly_msg[0]) enqueue(s_hourly_msg);
+    // Custom message on configurable interval
+    static uint8_t s_last_msg_min = 255;
+    if (s_msg_interval > 0 && s_hourly_msg[0] &&
+        t.tm_min % s_msg_interval == 0 && (uint8_t)t.tm_min != s_last_msg_min) {
+        s_last_msg_min = t.tm_min;
+        enqueue(s_hourly_msg);
     }
 
     // Clock display when idle and minute changed
@@ -295,11 +302,14 @@ static void update_clock() {
         show_static(ts);
     }
 
-    // Date scroll every 10 minutes when fully idle; skip :00 if hourly message set
+    // Date scroll on configurable interval when fully idle;
+    // skip if custom message fires at the same minute
     static uint8_t s_last_date_min = 255;
-    if (!s_active && s_cur_repeats == 0 && s_qhead == s_qtail &&
-        t.tm_min % 10 == 0 && (uint8_t)t.tm_min != s_last_date_min &&
-        !(t.tm_min == 0 && s_hourly_msg[0])) {
+    bool msg_fires_now = s_msg_interval > 0 && s_hourly_msg[0] &&
+                         t.tm_min % s_msg_interval == 0;
+    if (!msg_fires_now && s_date_interval > 0 &&
+        !s_active && s_cur_repeats == 0 && s_qhead == s_qtail &&
+        t.tm_min % s_date_interval == 0 && (uint8_t)t.tm_min != s_last_date_min) {
         s_last_date_min = t.tm_min;
         static const char *months[] = {
             "January","February","March","April","May","June",
@@ -524,6 +534,72 @@ static WiFiClient   s_wifi;
 static PubSubClient s_mqtt(s_wifi);
 static DNSServer    s_dns;
 
+// DNS resolution direct to 8.8.8.8 — bypasses whatever the ESP32's resolver does
+static bool simple_dns_resolve(const char *hostname, IPAddress &result) {
+    WiFiUDP udp;
+    if (!udp.begin(5354)) return false;
+
+    uint8_t pkt[64] = {};
+    int pos = 0;
+    pkt[pos++] = 0xAB; pkt[pos++] = 0xCD;  // transaction id
+    pkt[pos++] = 0x01; pkt[pos++] = 0x00;  // standard query, RD=1
+    pkt[pos++] = 0x00; pkt[pos++] = 0x01;  // QDCOUNT=1
+    pos += 6;                               // ANCOUNT/NSCOUNT/ARCOUNT=0
+    // encode hostname as length-prefixed labels
+    char tmp[64]; strncpy(tmp, hostname, sizeof(tmp)-1); tmp[63] = 0;
+    char *p = tmp;
+    while (*p) {
+        char *dot = strchr(p, '.');
+        uint8_t len = dot ? (dot - p) : (uint8_t)strlen(p);
+        pkt[pos++] = len; memcpy(pkt + pos, p, len); pos += len;
+        if (!dot) break;
+        p = dot + 1;
+    }
+    pkt[pos++] = 0;                         // name terminator
+    pkt[pos++] = 0x00; pkt[pos++] = 0x01;  // QTYPE=A
+    pkt[pos++] = 0x00; pkt[pos++] = 0x01;  // QCLASS=IN
+
+    udp.beginPacket(IPAddress(8, 8, 8, 8), 53);
+    udp.write(pkt, pos);
+    udp.endPacket();
+
+    uint32_t t0 = millis();
+    while (millis() - t0 < 4000) {
+        int len = udp.parsePacket();
+        if (len >= 12) {
+            uint8_t resp[512]; int rlen = udp.read(resp, sizeof(resp));
+            if (resp[0] != 0xAB || resp[1] != 0xCD) { delay(5); continue; }
+            uint16_t ancount = ((uint16_t)resp[6] << 8) | resp[7];
+            if (ancount == 0) { udp.stop(); return false; }
+            // skip header + question
+            int idx = 12;
+            while (idx < rlen) {
+                if ((resp[idx] & 0xC0) == 0xC0) { idx += 2; break; }
+                if (resp[idx] == 0) { idx++; break; }
+                idx += 1 + resp[idx];
+            }
+            idx += 4; // QTYPE+QCLASS
+            // parse answers
+            for (uint16_t i = 0; i < ancount && idx + 10 <= rlen; i++) {
+                if ((resp[idx] & 0xC0) == 0xC0) idx += 2;
+                else { while (idx < rlen && resp[idx]) idx += 1 + resp[idx]; idx++; }
+                uint16_t rtype = ((uint16_t)resp[idx]<<8)|resp[idx+1]; idx += 2;
+                uint16_t rcls  = ((uint16_t)resp[idx]<<8)|resp[idx+1]; idx += 2;
+                idx += 4; // TTL
+                uint16_t rdlen = ((uint16_t)resp[idx]<<8)|resp[idx+1]; idx += 2;
+                if (rtype == 1 && rcls == 1 && rdlen == 4 && idx + 4 <= rlen) {
+                    result = IPAddress(resp[idx], resp[idx+1], resp[idx+2], resp[idx+3]);
+                    udp.stop(); return true;
+                }
+                idx += rdlen;
+            }
+            udp.stop(); return false;
+        }
+        delay(10);
+    }
+    udp.stop(); return false;
+}
+
 static void wifi_start() {
     ulog("WiFi %s ", s_wifi_ssid);
     WiFi.mode(WIFI_STA);
@@ -625,21 +701,59 @@ static WebServer s_web(80);
 static void web_send_head(const char *title) {
     s_web.sendContent(
         "<!DOCTYPE html><html><head>"
+        "<meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>NEPAMesh Sign</title>"
         "<style>"
-        "body{font-family:sans-serif;max-width:520px;margin:16px auto;padding:0 12px}"
-        "h1{font-size:1.3em;margin-bottom:4px}h2{font-size:1em;margin:0 0 6px}"
-        ".s{background:#f5f5f5;padding:10px;margin:10px 0;border-radius:4px}"
-        "label{display:block;margin-top:8px;font-size:.9em;color:#444}"
-        "input,select{width:100%;padding:5px;box-sizing:border-box;margin-top:2px}"
-        "button{margin-top:14px;padding:10px 24px;background:#1a73e8;color:#fff;"
-        "border:none;border-radius:4px;cursor:pointer;font-size:1em}"
-        "nav{margin-bottom:10px}nav a{margin-right:12px;color:#1a73e8}"
-        "#lb{font-family:monospace;background:#111;color:#0f0;padding:8px;"
-        "height:360px;overflow-y:auto;white-space:pre-wrap;font-size:.8em}"
+        "body{font-family:'Courier New',monospace;max-width:540px;margin:0 auto;"
+        "padding:16px 12px;background:#0a0a0a;color:#33ff33}"
+    );
+    s_web.sendContent(
+        ".logo{text-align:center;margin-bottom:12px}"
+        ".logo img{height:72px;width:auto}"
+        "h1{font-size:1.3em;color:#44ff44;margin:0 0 2px;text-align:center;"
+        "letter-spacing:3px;text-transform:uppercase;"
+        "text-shadow:0 0 8px #33ff33}"
+        ".sub{text-align:center;font-size:.75em;color:#44dd44;letter-spacing:2px;"
+        "margin-bottom:12px}"
+    );
+    s_web.sendContent(
+        "h2{font-size:.85em;color:#44ff44;margin:0 0 8px;letter-spacing:2px;"
+        "text-transform:uppercase;border-bottom:1px solid #1a3a1a;padding-bottom:4px}"
+        ".s{background:#111;padding:12px;margin:10px 0;border-radius:4px;"
+        "border:1px solid #1a3a1a}"
+        ".send{border-color:#224422}"
+        "label{display:block;margin-top:8px;font-size:.8em;color:#66ff66}"
+    );
+    s_web.sendContent(
+        "input,select{width:100%;padding:6px;box-sizing:border-box;margin-top:3px;"
+        "background:#0a0a0a;color:#33ff33;border:1px solid #224422;border-radius:3px;"
+        "font-family:'Courier New',monospace;font-size:.9em}"
+        "input:focus,select:focus{outline:none;border-color:#33ff33}"
+        "input[type='color']{height:32px;padding:2px}"
+    );
+    s_web.sendContent(
+        "button{margin-top:14px;padding:10px 24px;background:#1a3a1a;color:#33ff33;"
+        "border:1px solid #33ff33;border-radius:4px;cursor:pointer;font-size:.9em;"
+        "font-family:'Courier New',monospace;letter-spacing:2px;text-transform:uppercase}"
+        "button:hover{background:#224422;text-shadow:0 0 6px #33ff33}"
+        "nav{text-align:center;margin-bottom:14px;border-bottom:1px solid #1a3a1a;"
+        "padding-bottom:10px}"
+        "nav a{margin:0 10px;color:#44dd44;text-decoration:none;font-size:.8em;"
+        "letter-spacing:2px;text-transform:uppercase}"
+        "nav a:hover{color:#66ff66}"
+    );
+    s_web.sendContent(
+        "#lb{font-family:'Courier New',monospace;background:#000;color:#33ff33;"
+        "padding:10px;height:360px;overflow-y:auto;white-space:pre-wrap;font-size:.8em;"
+        "border:1px solid #1a3a1a;border-radius:4px}"
         "</style></head><body>"
+        "<div class='logo'>"
+        "<img src='https://nepamesh.com/content/images/2026/04/smallernepamesh-3.png'"
+        " alt='NEPAMesh' onerror='this.style.display=\"none\"'>"
+        "</div>"
         "<h1>NEPAMesh Sign</h1>"
+        "<div class='sub'>LED Matrix Display</div>"
         "<nav><a href='/'>Settings</a><a href='/log'>Log</a><a href='/ota'>OTA</a></nav>"
     );
     (void)title;
@@ -659,7 +773,7 @@ static void handle_root() {
     web_send_head("Settings");
 
     // Direct message send
-    s_web.sendContent("<div class='s'><h2>Send Message</h2>"
+    s_web.sendContent("<div class='s send'><h2>&#9654; Send Message</h2>"
         "<form method='POST' action='/sendmsg'>"
         "<label>Message<input name='msg' placeholder='Text to display on screen'></label>"
         "<button type='submit'>Send to Screen</button>"
@@ -704,8 +818,12 @@ static void handle_root() {
     s_web.sendContent("<div class='s'><h2>Clock</h2>");
     sf("<label>UTC offset (hours, e.g. -4 for EDT, -5 for EST)"
        "<input name='tz' type='number' min='-12' max='14' value='%d'></label>", s_utc_offset);
-    sf("<label>Hourly message (empty to disable)"
+    sf("<label>Custom message (empty to disable)"
        "<input name='hm' value='%s'></label>", s_hourly_msg);
+    sf("<label>Custom message interval (minutes, 0 to disable)"
+       "<input name='miv' type='number' min='0' max='60' value='%u'></label>", s_msg_interval);
+    sf("<label>Date display interval (minutes, 0 to disable)"
+       "<input name='div' type='number' min='0' max='60' value='%u'></label>", s_date_interval);
     s_web.sendContent("</div>");
 
     s_web.sendContent("<button type='submit'>Save &amp; Restart</button></form></body></html>");
@@ -732,8 +850,10 @@ static void handle_save() {
             s_led_b = strtol(h.substring(5, 7).c_str(), nullptr, 16);
         }
     }
-    if (s_web.hasArg("tz")) s_utc_offset = (int8_t)s_web.arg("tz").toInt();
-    if (s_web.hasArg("hm")) strncpy(s_hourly_msg, s_web.arg("hm").c_str(), sizeof(s_hourly_msg) - 1);
+    if (s_web.hasArg("tz"))  s_utc_offset    = (int8_t)s_web.arg("tz").toInt();
+    if (s_web.hasArg("hm"))  strncpy(s_hourly_msg, s_web.arg("hm").c_str(), sizeof(s_hourly_msg) - 1);
+    if (s_web.hasArg("miv")) s_msg_interval  = s_web.arg("miv").toInt();
+    if (s_web.hasArg("div")) s_date_interval = s_web.arg("div").toInt();
     save_settings();
     s_web.send(200, "text/html",
         "<html><body><h2>Saved. Restarting...</h2>"
@@ -908,10 +1028,18 @@ void setup() {
         s_wifi.setTimeout(5000);
 
         int a, b, c, d;
-        if (sscanf(s_mqtt_host, "%d.%d.%d.%d", &a, &b, &c, &d) == 4)
+        if (sscanf(s_mqtt_host, "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
             s_mqtt.setServer(IPAddress(a, b, c, d), s_mqtt_port);
-        else
-            s_mqtt.setServer(s_mqtt_host, s_mqtt_port);
+        } else {
+            IPAddress resolved;
+            if (simple_dns_resolve(s_mqtt_host, resolved)) {
+                ulog("[DNS] %s -> %s\n", s_mqtt_host, resolved.toString().c_str());
+                s_mqtt.setServer(resolved, s_mqtt_port);
+            } else {
+                ulog("[DNS] FAILED to resolve %s, trying anyway\n", s_mqtt_host);
+                s_mqtt.setServer(s_mqtt_host, s_mqtt_port);
+            }
+        }
 
         s_mqtt.setKeepAlive(10);
         s_mqtt.setCallback(on_message);

@@ -11,7 +11,9 @@ colorlinks: true
 
 You've got a Meshtastic mesh radio network doing its thing across NEPA. Messages are flying around. Wouldn't it be cool if those messages physically scrolled across a glowing LED panel on your desk?
 
-That's exactly what this is. An ESP32 microcontroller grabs messages off the NEPAMesh MQTT broker, decrypts them (yes, they're encrypted — more on that in a sec), and scrolls them across an 8×32 WS2812B LED matrix as **NodeName: message text** in green text. It also learns everyone's callsigns automatically as they check in. Because why look up a node ID when the hardware can just remember it for you?
+That's exactly what this is. An ESP32 microcontroller grabs messages off the NEPAMesh MQTT broker, decrypts them (yes, they're encrypted — more on that in a sec), and scrolls them across an 8×32 WS2812B LED matrix as **NodeName: message text** in your choice of color. It also learns everyone's callsigns automatically as they check in.
+
+When no messages are arriving the panel shows a live clock synced to NTP. You can also configure it to scroll a custom message and the current date on a timer — handy as a lobby or desk sign that does double duty.
 
 On boot it runs a red → blue → green snake across every LED so you know the wiring works before you start wondering why nothing shows up.
 
@@ -146,7 +148,7 @@ The only thing you **must** set before the first flash is your WiFi credentials.
 #define WIFI_PASS       "YourPassword"
 ```
 
-Everything else — MQTT settings, display orientation, scroll speed, repeat count — can be changed at any time through the web interface once the device is running. You only need to touch `config.h` again if you change WiFi networks or want to update the compile-time defaults.
+Everything else — MQTT settings, display orientation, scroll speed, clock, scheduled messages — can be changed at any time through the web interface once the device is running. You only need to touch `config.h` again if you change WiFi networks or want to update the compile-time defaults.
 
 ## First boot without WiFi — captive portal
 
@@ -216,24 +218,69 @@ Then it connects and prints its IP address. You'll see this in the serial monito
 ```
 WiFi YourNetwork ... 192.168.x.x
 Web: http://192.168.x.x
+[DNS] mqtt.nepamesh.com -> 107.172.196.126
 MQTT OK
 SUB msh/US/2/e/LongFast/# -> OK
+[CLK] NTP synced (UTC ...)
+[CLK] show 10:30
 ```
 
 When mesh traffic arrives:
 
 ```
-[NODE] !A1B2C3D4 -> W3XYZ
-[MSG]  W3XYZ: Hello from the mesh
+[MQTT] from=!A1B2C3D4 portnum=1 payload_len=12
+[MSG] enqueued: W3XYZ: Hello from the mesh
+[DISP] scroll: W3XYZ: Hello from the mesh
 ```
 
 The panel will start scrolling. If you only see `!XXXX` instead of a callsign, that's normal — it learns short names from NodeInfo packets as nodes check in. Give it a few minutes of traffic.
+
+Telemetry and position packets (portnum ≠ 1) are silently dropped — they never appear on the display or inhibit the clock.
+
+---
+
+# Clock Display
+
+When no mesh messages are scrolling, the panel shows a live clock in **H:MM** format. The time is synced automatically via NTP (Google's time servers) on startup — no configuration required beyond setting the correct UTC offset.
+
+The clock updates every minute. As soon as a message finishes scrolling the clock reappears immediately — it doesn't wait for the next minute to tick over.
+
+**Setting the time zone:** open Settings and set **UTC offset** to your timezone's offset in hours. Examples:
+
+| Timezone | Offset |
+|----------|--------|
+| EST (UTC−5) | −5 |
+| EDT (UTC−4) | −4 |
+| CST (UTC−6) | −6 |
+| CDT (UTC−5) | −5 |
+| PST (UTC−8) | −8 |
+| PDT (UTC−7) | −7 |
+
+If NTP hasn't synced yet (no time set), the clock is suppressed and the panel stays dark between messages.
+
+---
+
+# Scheduled Messages and Date Display
+
+Two timers run in the background when the device is idle:
+
+### Custom message
+
+Set a **Custom message** and a **Custom message interval** (in minutes) in Settings. Every time that many minutes have elapsed on the clock, the message scrolls across the display — even if no MQTT traffic has arrived. Set interval to 0 to disable.
+
+Example: interval = 60, message = "Check us out at NEPAMesh.com" → scrolls at the top of every hour.
+
+### Date display
+
+Set a **Date display interval** (in minutes) in Settings. When idle, the current date scrolls in long form — e.g., *May 21, 2026* — every N minutes. Set to 0 to disable.
+
+The date display is skipped at any minute when the custom message is also scheduled to fire, so the two never overlap.
 
 ---
 
 # Web Interface
 
-Once the device is on your network, open `http://<device-ip>` in any browser. The web interface has three pages:
+Once the device is on your network, open `http://<device-ip>` in any browser. The interface matches the NEPAMesh color scheme — dark terminal background with green text.
 
 ### Settings (`/`)
 
@@ -244,33 +291,45 @@ Below that, change any of these without recompiling or reflashing:
 | Section | Fields |
 |---------|--------|
 | **WiFi** | SSID, Password |
-| **MQTT** | Host (IP), Port, User, Password, Subscription topic |
+| **MQTT** | Host (IP or hostname), Port, User, Password, Subscription topic |
 | **Display** | Connector side, Flip Y, Brightness, Scroll speed (ms), Message repeat count, Text color |
+| **Clock** | UTC offset, Custom message, Custom message interval (min), Date display interval (min) |
 
 Hit **Save & Restart** and the device reboots with the new settings stored in flash. They survive power cycles.
 
-**Text color** uses a standard color picker — choose any color for the scrolling text. Default is green (`#00c800`). Note that very dark colors may be hard to read at lower brightness levels.
+The **MQTT Host** field accepts either an IP address (`107.172.196.126`) or a hostname (`mqtt.nepamesh.com`) — the firmware resolves hostnames using Google's public DNS directly, so it works even if your router's DNS doesn't have the record.
+
+**Text color** uses a standard color picker — choose any color for the scrolling text. Default is green. Very dark colors may be hard to read at lower brightness levels.
+
+![Settings page](screenshots/settings.png)
 
 ### Log (`/log`)
 
 Live scrolling debug output — the same stream you'd see over serial or UDP. Useful for confirming MQTT is connected, watching packets arrive, and diagnosing issues without plugging anything in.
 
 ```
+[DNS] mqtt.nepamesh.com -> 107.172.196.126
 MQTT OK
 SUB msh/US/2/e/LongFast/# -> OK
-[MQTT] topic=msh/US/2/e/LongFast/!24da43f9 len=107
-[MQTT] from=!7196DA39 decoded_len=43
-[MQTT] portnum=1 payload_len=12
-[MSG] enqueued: W3XYZ: Hello mesh
+[CLK] NTP synced (UTC 1748000000)
+[CLK] show 10:30
+[MQTT] from=!43B6DD10 portnum=1 payload_len=12
+[MSG] enqueued: W3NEP: Hello from the mesh
+[DISP] scroll: W3NEP: Hello from the mesh
+[CLK] date: May 21, 2026
 ```
+
+![Log page](screenshots/log.png)
 
 ### OTA (`/ota`)
 
-Upload a new `.bin` firmware file directly from your browser — no USB cable, no espota command. Build the firmware with PlatformIO, then browse to `.pio/build/esp32c6/firmware.bin` and upload. The device reboots into the new firmware automatically.
+Upload a new `.bin` firmware file directly from your browser — no USB cable needed. Build the firmware with PlatformIO, browse to `.pio/build/esp32c6/firmware.bin`, and upload. The device reboots into the new firmware automatically.
+
+![OTA page](screenshots/ota.png)
 
 ### UDP log monitor
 
-If you prefer the command line, the device also broadcasts log output as UDP packets:
+If you prefer the command line, the device broadcasts log output as UDP packets on port 4210:
 
 ```bash
 nc -u -l 4210
@@ -292,6 +351,10 @@ Open the web interface at `http://<device-ip>`, go to **Settings → Display**, 
 | Text is upside-down | Enable Flip Y |
 | Both wrong | Change both |
 
+**Clock doesn't appear / shows wrong time**
+
+Check the **UTC offset** in Settings. The device only shows the clock after NTP has synced; watch the `/log` page on boot for `[CLK] NTP synced` to confirm. If it never syncs, check WiFi connectivity.
+
 **Captive portal page doesn't open automatically**
 
 Some devices are pickier than others. If the "sign in to network" prompt doesn't appear after connecting to the `sign` AP, just open a browser and go to `http://192.168.4.1` directly. Any URL you type will redirect there — the DNS server resolves everything to the AP address.
@@ -303,6 +366,10 @@ Your mesh is using a custom channel key instead of the default. You'll need to r
 **Nodes show as `!XXXX` instead of callsigns**
 
 Short names are learned passively from traffic. Ask someone to trigger a NodeInfo broadcast from their Meshtastic app (**Admin → Send NodeInfo**), or just wait — most nodes broadcast automatically every 15–60 minutes.
+
+**MQTT hostname not resolving**
+
+The firmware uses Google DNS (8.8.8.8) directly for hostname resolution, bypassing the router's DNS. If you see `[DNS] hostname -> 0.0.0.0` in the log, confirm the hostname exists by pinging it from another machine. IP addresses always work as an alternative.
 
 **MQTT keeps disconnecting**
 
@@ -326,6 +393,7 @@ You either skipped the `usermod` step, forgot to log out and back in, or the ude
 ```
 led-mqtt-meshtastic-8x32/
 ├── platformio.ini        Board targets (esp32dev + esp32c6) and libraries
+├── screenshots/          Web interface screenshots
 └── src/
     ├── config.h          Your settings live here  ← edit this
     ├── font5x7.h         5×7 pixel font for the display (ASCII 32–126)
