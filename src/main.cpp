@@ -50,6 +50,7 @@ static void ulog(const char *fmt, ...) {
 // ============================================================
 // Runtime settings  (NVS-backed, fall back to config.h defaults)
 // ============================================================
+static bool        s_ap_mode = false;
 static Preferences s_prefs;
 static char     s_wifi_ssid[33]  = WIFI_SSID;
 static char     s_wifi_pass[65]  = WIFI_PASS;
@@ -66,6 +67,8 @@ static uint8_t  s_repeat_count   = 3;
 static uint8_t  s_led_r          = 0;
 static uint8_t  s_led_g          = 200;
 static uint8_t  s_led_b          = 0;
+static int8_t   s_utc_offset     = 0;
+static char     s_hourly_msg[128] = {};
 
 static void load_settings() {
     s_prefs.begin("nepamesh", true);
@@ -84,6 +87,8 @@ static void load_settings() {
     s_led_r        = s_prefs.getUChar("d_lr",  s_led_r);
     s_led_g        = s_prefs.getUChar("d_lg",  s_led_g);
     s_led_b        = s_prefs.getUChar("d_lb",  s_led_b);
+    s_utc_offset   = (int8_t)s_prefs.getChar("d_tz",  s_utc_offset);
+    s_prefs.getString("hourly_msg", s_hourly_msg, sizeof(s_hourly_msg));
     s_prefs.end();
 }
 
@@ -104,6 +109,8 @@ static void save_settings() {
     s_prefs.putUChar("d_lr",     s_led_r);
     s_prefs.putUChar("d_lg",     s_led_g);
     s_prefs.putUChar("d_lb",     s_led_b);
+    s_prefs.putChar("d_tz",      s_utc_offset);
+    s_prefs.putString("hourly_msg", s_hourly_msg);
     s_prefs.end();
 }
 
@@ -134,10 +141,12 @@ static uint16_t XY(int x, int y) {
 // ============================================================
 #define SCROLL_BUF_COLS 640
 static uint8_t  s_buf[SCROLL_BUF_COLS];
-static int      s_width   = 0;
-static int      s_pos     = 0;
-static uint32_t s_last_ms = 0;
-static bool     s_active  = false;
+static int      s_width      = 0;
+static int      s_pos        = 0;
+static uint32_t s_last_ms    = 0;
+static bool     s_active     = false;
+static char     s_cur_msg[128] = {};  // 128 == MSG_LEN (defined later)
+static int      s_cur_repeats  = 0;
 
 static int render_text(const char *text, uint8_t *buf, int max_cols) {
     int col = 0;
@@ -223,6 +232,85 @@ static bool dequeue(char *out) {
     strcpy(out, s_q[s_qhead]);
     s_qhead = (s_qhead + 1) % MSG_Q;
     return true;
+}
+
+// ============================================================
+// Clock display + hourly message
+// ============================================================
+static void show_static(const char *text) {
+    uint8_t tmp[SCROLL_BUF_COLS];
+    int w = render_text(text, tmp, SCROLL_BUF_COLS);
+    int char_w = w - 2 - MATRIX_W;
+    if (char_w < 0) char_w = 0;
+    int pad = (MATRIX_W - char_w) / 2;
+    FastLED.clear();
+    for (int x = 0; x < MATRIX_W; x++) {
+        int src = x - pad;
+        uint8_t col_bits = (src >= 0 && src < char_w) ? tmp[2 + src] : 0;
+        for (int y = 0; y < MATRIX_H; y++) {
+            uint16_t idx = XY(x, y);
+            if (idx < NUM_LEDS)
+                leds[idx] = (col_bits & (1 << y)) ? CRGB(s_led_r, s_led_g, s_led_b) : CRGB::Black;
+        }
+    }
+    FastLED.show();
+}
+
+static uint8_t  s_last_clock_min = 255;
+static uint8_t  s_last_hour_seen = 255;
+static uint32_t s_last_clock_ms  = 0;
+
+static void update_clock() {
+    if (s_ap_mode) return;
+    if (millis() - s_last_clock_ms < 1000) return;
+    s_last_clock_ms = millis();
+
+    time_t now; time(&now);
+    if (now < 1000000000UL) {
+        static uint32_t s_ntp_log_ms = 0;
+        if (millis() - s_ntp_log_ms > 15000) {
+            s_ntp_log_ms = millis();
+            ulog("[CLK] waiting for NTP\n");
+        }
+        return;
+    }
+    // Apply UTC offset manually; system clock stores raw UTC
+    time_t local_now = now + (long)s_utc_offset * 3600;
+    struct tm t; gmtime_r(&local_now, &t);
+
+    // Hourly message at top of each hour
+    if ((uint8_t)t.tm_hour != s_last_hour_seen) {
+        s_last_hour_seen = t.tm_hour;
+        if (t.tm_min == 0 && s_hourly_msg[0]) enqueue(s_hourly_msg);
+    }
+
+    // Clock display when idle and minute changed
+    if (!s_active && (uint8_t)t.tm_min != s_last_clock_min) {
+        s_last_clock_min = t.tm_min;
+        int h = t.tm_hour % 12;
+        if (h == 0) h = 12;
+        char ts[8];
+        snprintf(ts, sizeof(ts), "%d:%02d", h, t.tm_min);
+        ulog("[CLK] show %s\n", ts);
+        show_static(ts);
+    }
+
+    // Date scroll every 10 minutes when fully idle; skip :00 if hourly message set
+    static uint8_t s_last_date_min = 255;
+    if (!s_active && s_cur_repeats == 0 && s_qhead == s_qtail &&
+        t.tm_min % 10 == 0 && (uint8_t)t.tm_min != s_last_date_min &&
+        !(t.tm_min == 0 && s_hourly_msg[0])) {
+        s_last_date_min = t.tm_min;
+        static const char *months[] = {
+            "January","February","March","April","May","June",
+            "July","August","September","October","November","December"
+        };
+        char ds[32];
+        snprintf(ds, sizeof(ds), "%s %d, %d",
+                 months[t.tm_mon], t.tm_mday, 1900 + t.tm_year);
+        ulog("[CLK] date: %s\n", ds);
+        start_scroll(ds);
+    }
 }
 
 // ============================================================
@@ -423,6 +511,9 @@ static void on_message(char *topic, uint8_t *payload, unsigned int length) {
             cache_node(from_node, sname);
             ulog("[NODE] !%08X -> %s\n", (unsigned)from_node, sname);
         }
+    } else {
+        // telemetry, position, routing, etc. — log only, never display
+        ulog("[SKIP] portnum=%u\n", (unsigned)portnum);
     }
 }
 
@@ -432,7 +523,6 @@ static void on_message(char *topic, uint8_t *payload, unsigned int length) {
 static WiFiClient   s_wifi;
 static PubSubClient s_mqtt(s_wifi);
 static DNSServer    s_dns;
-static bool         s_ap_mode = false;
 
 static void wifi_start() {
     ulog("WiFi %s ", s_wifi_ssid);
@@ -485,6 +575,45 @@ static void mqtt_check() {
         ulog("SUB %s -> %s\n", s_mqtt_topic, sub ? "OK" : "FAIL");
     } else {
         ulog("MQTT err %d\n", s_mqtt.state());
+    }
+}
+
+// ============================================================
+// Custom NTP (bypasses broken IDF5 SNTP client)
+// ============================================================
+static WiFiUDP  s_ntp_udp;
+static bool     s_ntp_pending  = false;
+static uint32_t s_ntp_sent_ms  = 0;
+
+static void ntp_poll() {
+    if (s_ap_mode) return;
+    time_t now; time(&now);
+    if (now >= 1000000000UL) return;  // already synced
+
+    if (!s_ntp_pending || millis() - s_ntp_sent_ms > 30000) {
+        s_ntp_udp.stop();
+        s_ntp_udp.begin(2390);
+        uint8_t pkt[48] = {};
+        pkt[0] = 0x1b;  // LI=0, VN=3, Mode=3 (client)
+        s_ntp_udp.beginPacket(IPAddress(216, 239, 35, 0), 123);
+        s_ntp_udp.write(pkt, 48);
+        s_ntp_udp.endPacket();
+        s_ntp_pending  = true;
+        s_ntp_sent_ms  = millis();
+        ulog("[CLK] NTP request sent\n");
+    }
+
+    if (s_ntp_udp.parsePacket() >= 48) {
+        uint8_t buf[48];
+        s_ntp_udp.read(buf, 48);
+        uint32_t secs = ((uint32_t)buf[40] << 24) | ((uint32_t)buf[41] << 16) |
+                        ((uint32_t)buf[42] << 8)  |  buf[43];
+        secs -= 2208988800UL;  // NTP epoch 1900 → Unix epoch 1970
+        struct timeval tv = { .tv_sec = (time_t)secs, .tv_usec = 0 };
+        settimeofday(&tv, nullptr);
+        s_ntp_udp.stop();
+        s_ntp_pending = false;
+        ulog("[CLK] NTP synced (UTC %lu)\n", (unsigned long)secs);
     }
 }
 
@@ -571,6 +700,14 @@ static void handle_root() {
     sf("<label>Text color<input name='col' type='color' value='%s'></label>", hex);
     s_web.sendContent("</div>");
 
+    // Clock
+    s_web.sendContent("<div class='s'><h2>Clock</h2>");
+    sf("<label>UTC offset (hours, e.g. -4 for EDT, -5 for EST)"
+       "<input name='tz' type='number' min='-12' max='14' value='%d'></label>", s_utc_offset);
+    sf("<label>Hourly message (empty to disable)"
+       "<input name='hm' value='%s'></label>", s_hourly_msg);
+    s_web.sendContent("</div>");
+
     s_web.sendContent("<button type='submit'>Save &amp; Restart</button></form></body></html>");
 }
 
@@ -595,6 +732,8 @@ static void handle_save() {
             s_led_b = strtol(h.substring(5, 7).c_str(), nullptr, 16);
         }
     }
+    if (s_web.hasArg("tz")) s_utc_offset = (int8_t)s_web.arg("tz").toInt();
+    if (s_web.hasArg("hm")) strncpy(s_hourly_msg, s_web.arg("hm").c_str(), sizeof(s_hourly_msg) - 1);
     save_settings();
     s_web.send(200, "text/html",
         "<html><body><h2>Saved. Restarting...</h2>"
@@ -669,9 +808,6 @@ static void handle_ota_upload() {
         else                  ulog("[OTA] end failed\n");
     }
 }
-
-static char s_cur_msg[MSG_LEN] = {};
-static int  s_cur_repeats      = 0;
 
 static void handle_send_msg() {
     if (s_web.hasArg("msg") && s_web.arg("msg").length() > 0) {
@@ -795,10 +931,15 @@ void loop() {
         ArduinoOTA.handle();
         mqtt_check();
         s_mqtt.loop();
+        ntp_poll();
     }
     s_web.handleClient();
 
+    static bool s_prev_active = false;
     update_display();
+    if (s_prev_active && !s_active) s_last_clock_min = 255;  // any scroll just finished — refresh clock
+    s_prev_active = s_active;
+    update_clock();
 
     if (!s_active) {
         if (s_cur_repeats > 0 && s_cur_repeats < s_repeat_count) {
