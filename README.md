@@ -241,7 +241,7 @@ Telemetry and position packets (portnum ≠ 1) are silently dropped — they nev
 
 # Clock Display
 
-When no mesh messages are scrolling, the panel shows a live clock in **H:MM** format. The time is synced automatically via NTP (Google's time servers) on startup — no configuration required beyond setting the correct UTC offset.
+When the **Idle display** setting is set to **Clock** (the default), the panel shows a live clock in **H:MM** format whenever no messages are scrolling. The time is synced automatically via NTP on startup — no configuration required beyond setting the correct UTC offset.
 
 The clock updates every minute. As soon as a message finishes scrolling the clock reappears immediately — it doesn't wait for the next minute to tick over.
 
@@ -278,6 +278,58 @@ The date display is skipped at any minute when the custom message is also schedu
 
 ---
 
+# Idle Animations
+
+The **Idle display** dropdown (Settings → Display) controls what the panel does when it's waiting between messages. Incoming MQTT messages, date scrolls, and hourly messages always interrupt the idle animation and resume it when they finish.
+
+| Option | What it does |
+|--------|-------------|
+| **Clock** | Shows the time in H:MM format *(default)* |
+| **Fire** | Heat-diffusion fire animation rising from the bottom edge |
+| **Matrix Rain** | Falling green drops with bright heads and fading trails |
+| **Scroll message (loop)** | Continuously re-scrolls whatever is in the **Custom message** field |
+| **Twinkle** | Random pixels spawn at full brightness and fade through shifting colors |
+| **Off** | Panel goes dark between messages |
+
+**Fire orientation:** the flames rise from logical row 7 toward row 0. If they come out upside-down on your panel, toggle **Flip Y** in Display settings.
+
+**Scroll message (loop):** set your Custom message to whatever you want on permanent rotation — a callsign, a URL, a status line — and this mode will keep scrolling it until a real mesh message arrives and takes priority.
+
+---
+
+# Emoji Rendering
+
+Meshtastic users love to pepper their messages with emoji. The display renders 38 common ones in their correct colors as 5×7 pixel art glyphs, inline with the rest of the scrolling text:
+
+| Category | Emoji |
+|----------|-------|
+| Hearts | ❤️ 🧡 💛 💚 💙 💜 |
+| Faces | 😊 ☺️ 😂 😢 😠 |
+| Nature | 🔥 ☀️ 🌧️ |
+| Symbols | ⭐ 🌟 ⚠️ ✅ ❌ 💯 📍 🎉 |
+| Hands | 👍 👎 👋 🙏 |
+| Circles | 🔴 🟠 🟡 🟢 🔵 🟣 |
+| Radio/mesh | 📡 📻 🔋 |
+| Alerts | 🆘 🛑 |
+| Other | 🌡️ |
+
+Unrecognized emoji are silently skipped rather than rendering as a box or `?`. Variation selectors and zero-width joiners are stripped harmlessly.
+
+---
+
+# Text Effects
+
+The **Text effect** dropdown (Settings → Display) adds color effects to scrolling text. The effect applies at render time, so it works with both ASCII text and emoji.
+
+| Effect | Description |
+|--------|-------------|
+| **None** | Solid color chosen by the Text color picker |
+| **Rainbow** | Hue varies across the length of the message — left to right |
+| **Cycle** | Same hue spread as Rainbow, but the whole thing slowly rotates over time |
+| **Gradient** | Text color fades to a second color (set with the **Gradient end color** picker) across the message |
+
+---
+
 # Web Interface
 
 Once the device is on your network, open `http://<device-ip>` in any browser. The interface matches the NEPAMesh color scheme — dark terminal background with green text.
@@ -292,7 +344,7 @@ Below that, change any of these without recompiling or reflashing:
 |---------|--------|
 | **WiFi** | SSID, Password |
 | **MQTT** | Host (IP or hostname), Port, User, Password, Subscription topic |
-| **Display** | Connector side, Flip Y, Brightness, Scroll speed (ms), Message repeat count, Text color |
+| **Display** | Connector side, Flip Y, Brightness, Scroll speed (ms), Message repeat count, Text color, Text effect, Gradient end color, Idle display |
 | **Clock** | UTC offset, Custom message, Custom message interval (min), Date display interval (min) |
 
 Hit **Save & Restart** and the device reboots with the new settings stored in flash. They survive power cycles.
@@ -301,7 +353,11 @@ The **MQTT Host** field accepts either an IP address (`107.172.196.126`) or a ho
 
 **Text color** uses a standard color picker — choose any color for the scrolling text. Default is green. Very dark colors may be hard to read at lower brightness levels.
 
-![Settings page](screenshots/settings.png)
+**Text effect** adds Rainbow, Cycle, or Gradient coloring to scrolling text. See the Text Effects section for details.
+
+**Idle display** selects what the panel shows between messages. See the Idle Animations section for details.
+
+![Settings page](screenshots/settings_full.png)
 
 ### Log (`/log`)
 
@@ -319,13 +375,19 @@ SUB msh/US/2/e/LongFast/# -> OK
 [CLK] date: May 21, 2026
 ```
 
-![Log page](screenshots/log.png)
+![Log page](screenshots/log_full.png)
 
 ### OTA (`/ota`)
 
 Upload a new `.bin` firmware file directly from your browser — no USB cable needed. Build the firmware with PlatformIO, browse to `.pio/build/esp32c6/firmware.bin`, and upload. The device reboots into the new firmware automatically.
 
-![OTA page](screenshots/ota.png)
+You can also upload from the command line without touching a browser:
+
+```bash
+curl -F "f=@.pio/build/esp32c6/firmware.bin" http://<device-ip>/ota
+```
+
+![OTA page](screenshots/ota_full.png)
 
 ### UDP log monitor
 
@@ -403,6 +465,7 @@ led-mqtt-meshtastic-8x32/
 └── src/
     ├── config.h          Your settings live here  ← edit this
     ├── font5x7.h         5×7 pixel font for the display (ASCII 32–126)
+    ├── emoji.h           38 hand-crafted 5×7 emoji glyphs with correct colors
     └── main.cpp          Everything else
 ```
 

@@ -11,6 +11,7 @@
 #include "mbedtls/aes.h"
 #include "config.h"
 #include "font5x7.h"
+#include "emoji.h"
 
 // ============================================================
 // Log ring buffer + UDP broadcast
@@ -71,6 +72,11 @@ static int8_t   s_utc_offset     = 0;
 static char     s_hourly_msg[256] = {};
 static uint8_t  s_msg_interval   = 60;   // minutes between custom message (0 = off)
 static uint8_t  s_date_interval  = 10;   // minutes between date display  (0 = off)
+static uint8_t  s_effect         = 0;    // 0=none 1=rainbow 2=cycle 3=gradient
+static uint8_t  s_grad_r         = 255;  // gradient end color
+static uint8_t  s_grad_g         = 0;
+static uint8_t  s_grad_b         = 0;
+static uint8_t  s_idle_mode      = 0;    // 0=clock 1=fire 2=rain 3=scroll 4=twinkle 5=off
 
 static void load_settings() {
     s_prefs.begin("nepamesh", true);
@@ -93,6 +99,11 @@ static void load_settings() {
     s_prefs.getString("hourly_msg", s_hourly_msg, sizeof(s_hourly_msg));
     s_msg_interval   = s_prefs.getUChar("m_iv",  s_msg_interval);
     s_date_interval  = s_prefs.getUChar("d_iv",  s_date_interval);
+    s_effect         = s_prefs.getUChar("d_fx",  s_effect);
+    s_grad_r         = s_prefs.getUChar("d_gr",  s_grad_r);
+    s_grad_g         = s_prefs.getUChar("d_gg",  s_grad_g);
+    s_grad_b         = s_prefs.getUChar("d_gb",  s_grad_b);
+    s_idle_mode      = s_prefs.getUChar("d_im",  s_idle_mode);
     s_prefs.end();
 }
 
@@ -117,6 +128,11 @@ static void save_settings() {
     s_prefs.putString("hourly_msg", s_hourly_msg);
     s_prefs.putUChar("m_iv",        s_msg_interval);
     s_prefs.putUChar("d_iv",        s_date_interval);
+    s_prefs.putUChar("d_fx",        s_effect);
+    s_prefs.putUChar("d_gr",        s_grad_r);
+    s_prefs.putUChar("d_gg",        s_grad_g);
+    s_prefs.putUChar("d_gb",        s_grad_b);
+    s_prefs.putUChar("d_im",        s_idle_mode);
     s_prefs.end();
 }
 
@@ -146,7 +162,7 @@ static uint16_t XY(int x, int y) {
 // Scrolling text
 // ============================================================
 #define SCROLL_BUF_COLS 1600
-static uint8_t  s_buf[SCROLL_BUF_COLS];
+static CRGB s_buf[SCROLL_BUF_COLS][MATRIX_H];
 static int      s_width      = 0;
 static int      s_pos        = 0;
 static uint32_t s_last_ms    = 0;
@@ -154,17 +170,57 @@ static bool     s_active     = false;
 static char     s_cur_msg[256] = {};  // 256 == MSG_LEN (defined later)
 static int      s_cur_repeats  = 0;
 
-static int render_text(const char *text, uint8_t *buf, int max_cols) {
-    int col = 0;
-    buf[col++] = 0; buf[col++] = 0;
-    for (const char *p = text; *p && col < max_cols - 6; p++) {
-        uint8_t c = (uint8_t)*p;
-        if (c < 32 || c > 126) c = '?';
-        const uint8_t *g = font5x7[c - 32];
-        for (int i = 0; i < 5; i++) buf[col++] = g[i];
-        buf[col++] = 0;
+// Decode one UTF-8 code point; advances *p past the bytes consumed.
+static uint32_t utf8_next(const char *&p) {
+    uint8_t c = (uint8_t)*p;
+    if (!c) return 0;
+    p++;
+    if (c < 0x80) return c;
+    uint32_t cp; int extra;
+    if      ((c & 0xE0) == 0xC0) { cp = c & 0x1F; extra = 1; }
+    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
+    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
+    else return 0xFFFD;
+    while (extra--) {
+        if ((*p & 0xC0) != 0x80) return 0xFFFD;
+        cp = (cp << 6) | ((uint8_t)*p++ & 0x3F);
     }
-    for (int i = 0; i < MATRIX_W && col < max_cols; i++) buf[col++] = 0;
+    return cp;
+}
+
+static int render_text(const char *text, CRGB buf[][MATRIX_H], int max_cols) {
+    auto blank_col = [&](int c) {
+        for (int r = 0; r < MATRIX_H; r++) buf[c][r] = CRGB::Black;
+    };
+    int col = 0;
+    blank_col(col++); blank_col(col++);     // 2 leading blank cols
+
+    const char *p = text;
+    while (*p && col < max_cols - 7) {
+        uint32_t cp = utf8_next(p);
+        if (!cp) break;
+        // skip variation selectors, ZWJ, combining chars
+        if (cp == 0xFE0F || cp == 0x200D || cp == 0x20E3) continue;
+
+        const EmojiGlyph *eg = find_emoji(cp);
+        if (eg) {
+            for (int ec = 0; ec < EMOJI_W && col < max_cols - 2; ec++, col++) {
+                for (int r = 0; r < MATRIX_H; r++)
+                    buf[col][r] = (r < EMOJI_H) ? eg->px[r][ec] : CRGB::Black;
+            }
+            blank_col(col++);               // 1 space after emoji
+        } else if (cp >= 32 && cp <= 126) {
+            const uint8_t *g = font5x7[cp - 32];
+            for (int fc = 0; fc < 5; fc++, col++) {
+                uint8_t bits = g[fc];
+                for (int r = 0; r < MATRIX_H; r++)
+                    buf[col][r] = (bits & (1 << r)) ? CRGB(s_led_r, s_led_g, s_led_b) : CRGB::Black;
+            }
+            blank_col(col++);               // 1 space after char
+        }
+        // unknown code points silently skipped
+    }
+    for (int i = 0; i < MATRIX_W && col < max_cols; i++) blank_col(col++);
     return col;
 }
 
@@ -176,6 +232,141 @@ static void start_scroll(const char *text) {
     s_last_ms = millis();
 }
 
+static CRGB apply_effect(CRGB base, int src) {
+    if (!base) return CRGB::Black;          // off pixel — always stays off
+    if (s_effect == 0) return base;         // none
+    uint8_t hue;
+    if (s_effect == 1) {                    // rainbow: hue by position in buffer
+        hue = (uint8_t)((uint32_t)src * 255 / max(s_width, 1));
+        return CHSV(hue, 240, 255);
+    }
+    if (s_effect == 2) {                    // cycle: hue animates over time
+        hue = (uint8_t)(src * 4 + millis() / 15);
+        return CHSV(hue, 240, 255);
+    }
+    if (s_effect == 3) {                    // gradient: text color → end color
+        uint8_t t = (uint8_t)((uint32_t)src * 255 / max(s_width, 1));
+        return CRGB(
+            s_led_r + (int8_t)(((int)s_grad_r - s_led_r) * t / 255),
+            s_led_g + (int8_t)(((int)s_grad_g - s_led_g) * t / 255),
+            s_led_b + (int8_t)(((int)s_grad_b - s_led_b) * t / 255)
+        );
+    }
+    return base;
+}
+
+// ============================================================
+// Idle animations
+// ============================================================
+
+// --- Fire ---
+static uint8_t  s_fire[MATRIX_H][MATRIX_W];
+static uint32_t s_fire_ms = 0;
+
+static CRGB heat_color(uint8_t h) {
+    if (h < 85)  return CRGB(h * 3, 0, 0);
+    if (h < 170) return CRGB(255, (h - 85) * 3, 0);
+    return CRGB(255, 255, (h - 170) * 3);
+}
+
+static void update_fire() {
+    if (millis() - s_fire_ms < 50) return;
+    s_fire_ms = millis();
+    for (int y = 0; y < MATRIX_H - 1; y++) {
+        for (int x = 0; x < MATRIX_W; x++) {
+            uint16_t v = s_fire[y+1][x]
+                       + s_fire[y+1][(x+1) % MATRIX_W]
+                       + s_fire[y+1][(x-1+MATRIX_W) % MATRIX_W];
+            v += (y + 2 < MATRIX_H) ? s_fire[y+2][x] : s_fire[y+1][x];
+            v /= 4;
+            uint8_t cool = random8(0, 30);
+            s_fire[y][x] = v > cool ? (uint8_t)(v - cool) : 0;
+        }
+    }
+    for (int x = 0; x < MATRIX_W; x++)
+        s_fire[MATRIX_H-1][x] = random8(180, 255);
+    for (int x = 0; x < MATRIX_W; x++)
+        for (int y = 0; y < MATRIX_H; y++) {
+            uint16_t i = XY(x, y);
+            if (i < NUM_LEDS) leds[i] = heat_color(s_fire[y][x]);
+        }
+    FastLED.show();
+}
+
+// --- Matrix Rain ---
+struct RainDrop { int8_t y; uint8_t skip; uint8_t frame; uint8_t len; };
+static RainDrop s_rain[MATRIX_W];
+static uint32_t s_rain_ms  = 0;
+static bool     s_rain_init = false;
+
+static void update_rain() {
+    if (!s_rain_init) {
+        for (int x = 0; x < MATRIX_W; x++)
+            s_rain[x] = { (int8_t)-(int8_t)random8(0, MATRIX_H * 2),
+                          random8(1, 4), 0, random8(2, 6) };
+        s_rain_init = true;
+    }
+    if (millis() - s_rain_ms < 80) return;
+    s_rain_ms = millis();
+    FastLED.clear();
+    for (int x = 0; x < MATRIX_W; x++) {
+        RainDrop &d = s_rain[x];
+        if (++d.frame >= d.skip) {
+            d.frame = 0;
+            if (++d.y > MATRIX_H + d.len) {
+                d.y    = -(int8_t)random8(1, MATRIX_H * 2);
+                d.skip = random8(1, 4);
+                d.len  = random8(2, 6);
+            }
+        }
+        for (int t = 0; t <= d.len; t++) {
+            int py = d.y - t;
+            if (py < 0 || py >= MATRIX_H) continue;
+            uint16_t i = XY(x, py);
+            if (i >= NUM_LEDS) continue;
+            if (t == 0) {
+                leds[i] = CRGB(180, 255, 180);
+            } else {
+                uint8_t v = (uint8_t)(255 - (uint16_t)t * 220 / d.len);
+                leds[i] = CRGB(0, v, 0);
+            }
+        }
+    }
+    FastLED.show();
+}
+
+// --- Twinkle ---
+static uint8_t  s_twinkle[MATRIX_W][MATRIX_H];
+static uint32_t s_twinkle_ms = 0;
+
+static void update_twinkle() {
+    if (millis() - s_twinkle_ms < 50) return;
+    s_twinkle_ms = millis();
+    for (int x = 0; x < MATRIX_W; x++) {
+        for (int y = 0; y < MATRIX_H; y++) {
+            if (s_twinkle[x][y] == 0 && random8(100) < 3)
+                s_twinkle[x][y] = 255;
+            uint16_t i = XY(x, y);
+            if (i >= NUM_LEDS) continue;
+            uint8_t v = s_twinkle[x][y];
+            leds[i] = v ? CRGB(CHSV((uint8_t)(x * 8 + y * 32 + millis() / 50), 200, v))
+                        : CRGB::Black;
+            if (v > 15) s_twinkle[x][y] = v - 15;
+            else        s_twinkle[x][y] = 0;
+        }
+    }
+    FastLED.show();
+}
+
+static void update_idle_animation() {
+    switch (s_idle_mode) {
+        case 1: update_fire();    break;
+        case 2: update_rain();    break;
+        case 4: update_twinkle(); break;
+        default: break;
+    }
+}
+
 static void update_display() {
     if (!s_active) return;
     if (millis() - s_last_ms < (uint32_t)s_scroll_ms) return;
@@ -183,11 +374,12 @@ static void update_display() {
 
     for (int x = 0; x < MATRIX_W; x++) {
         int src = s_pos + x;
-        uint8_t col_bits = (src >= 0 && src < s_width) ? s_buf[src] : 0;
         for (int y = 0; y < MATRIX_H; y++) {
             uint16_t idx = XY(x, y);
-            if (idx < NUM_LEDS)
-                leds[idx] = (col_bits & (1 << y)) ? CRGB(s_led_r, s_led_g, s_led_b) : CRGB::Black;
+            if (idx < NUM_LEDS) {
+                CRGB px = (src >= 0 && src < s_width) ? s_buf[src][y] : CRGB::Black;
+                leds[idx] = apply_effect(px, src);
+            }
         }
     }
     FastLED.show();
@@ -244,19 +436,18 @@ static bool dequeue(char *out) {
 // Clock display + hourly message
 // ============================================================
 static void show_static(const char *text) {
-    uint8_t tmp[SCROLL_BUF_COLS];
-    int w = render_text(text, tmp, SCROLL_BUF_COLS);
+    // Render into global s_buf (safe — only called when !s_active)
+    int w = render_text(text, s_buf, SCROLL_BUF_COLS);
     int char_w = w - 2 - MATRIX_W;
     if (char_w < 0) char_w = 0;
     int pad = (MATRIX_W - char_w) / 2;
     FastLED.clear();
     for (int x = 0; x < MATRIX_W; x++) {
-        int src = x - pad;
-        uint8_t col_bits = (src >= 0 && src < char_w) ? tmp[2 + src] : 0;
+        int src = 2 + (x - pad);            // 2 skips leading blank cols
         for (int y = 0; y < MATRIX_H; y++) {
             uint16_t idx = XY(x, y);
             if (idx < NUM_LEDS)
-                leds[idx] = (col_bits & (1 << y)) ? CRGB(s_led_r, s_led_g, s_led_b) : CRGB::Black;
+                leds[idx] = (src >= 0 && src < w) ? s_buf[src][y] : CRGB::Black;
         }
     }
     FastLED.show();
@@ -291,15 +482,17 @@ static void update_clock() {
         enqueue(s_hourly_msg);
     }
 
-    // Clock display when idle and minute changed
+    // Clock display when idle and minute changed — only in clock idle mode
     if (!s_active && (uint8_t)t.tm_min != s_last_clock_min) {
         s_last_clock_min = t.tm_min;
-        int h = t.tm_hour % 12;
-        if (h == 0) h = 12;
-        char ts[8];
-        snprintf(ts, sizeof(ts), "%d:%02d", h, t.tm_min);
-        ulog("[CLK] show %s\n", ts);
-        show_static(ts);
+        if (s_idle_mode == 0) {
+            int h = t.tm_hour % 12;
+            if (h == 0) h = 12;
+            char ts[8];
+            snprintf(ts, sizeof(ts), "%d:%02d", h, t.tm_min);
+            ulog("[CLK] show %s\n", ts);
+            show_static(ts);
+        }
     }
 
     // Date scroll on configurable interval when fully idle;
@@ -510,7 +703,7 @@ static void on_message(char *topic, uint8_t *payload, unsigned int length) {
         memcpy(msg + plen, payload_bytes, tlen);
         msg[plen + tlen] = 0;
         for (char *c = msg; *c; c++)
-            if ((uint8_t)*c < 32 || (uint8_t)*c > 126) *c = '?';
+            if ((uint8_t)*c < 32 && *c != '\t') *c = ' '; // strip ctrl chars; UTF-8 high bytes pass through
 
         enqueue(msg);
         ulog("[MSG] enqueued: %s\n", msg);
@@ -760,7 +953,7 @@ static void web_send_head(const char *title) {
 }
 
 static void sf(const char *fmt, ...) {
-    char buf[256];
+    char buf[512];
     va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
@@ -812,6 +1005,28 @@ static void handle_root() {
     char hex[8];
     snprintf(hex, sizeof(hex), "#%02x%02x%02x", s_led_r, s_led_g, s_led_b);
     sf("<label>Text color<input name='col' type='color' value='%s'></label>", hex);
+    sf("<label>Text effect<select name='fx'>"
+       "<option value='0'%s>None</option>"
+       "<option value='1'%s>Rainbow</option>"
+       "<option value='2'%s>Cycle</option>"
+       "<option value='3'%s>Gradient (text color → end color)</option>"
+       "</select></label>",
+       s_effect==0?" selected":"", s_effect==1?" selected":"",
+       s_effect==2?" selected":"", s_effect==3?" selected":"");
+    char hex2[8];
+    snprintf(hex2, sizeof(hex2), "#%02x%02x%02x", s_grad_r, s_grad_g, s_grad_b);
+    sf("<label>Gradient end color<input name='gcol' type='color' value='%s'></label>", hex2);
+    sf("<label>Idle display<select name='im'>"
+       "<option value='0'%s>Clock</option>"
+       "<option value='1'%s>Fire</option>"
+       "<option value='2'%s>Matrix Rain</option>"
+       "<option value='3'%s>Scroll message (loop)</option>"
+       "<option value='4'%s>Twinkle</option>"
+       "<option value='5'%s>Off</option>"
+       "</select></label>",
+       s_idle_mode==0?" selected":"", s_idle_mode==1?" selected":"",
+       s_idle_mode==2?" selected":"", s_idle_mode==3?" selected":"",
+       s_idle_mode==4?" selected":"", s_idle_mode==5?" selected":"");
     s_web.sendContent("</div>");
 
     // Clock
@@ -850,6 +1065,16 @@ static void handle_save() {
             s_led_b = strtol(h.substring(5, 7).c_str(), nullptr, 16);
         }
     }
+    if (s_web.hasArg("fx"))  s_effect = s_web.arg("fx").toInt();
+    if (s_web.hasArg("gcol")) {
+        String h = s_web.arg("gcol");
+        if (h.length() == 7 && h[0] == '#') {
+            s_grad_r = strtol(h.substring(1,3).c_str(), nullptr, 16);
+            s_grad_g = strtol(h.substring(3,5).c_str(), nullptr, 16);
+            s_grad_b = strtol(h.substring(5,7).c_str(), nullptr, 16);
+        }
+    }
+    if (s_web.hasArg("im"))  s_idle_mode     = s_web.arg("im").toInt();
     if (s_web.hasArg("tz"))  s_utc_offset    = (int8_t)s_web.arg("tz").toInt();
     if (s_web.hasArg("hm"))  strncpy(s_hourly_msg, s_web.arg("hm").c_str(), sizeof(s_hourly_msg) - 1);
     if (s_web.hasArg("miv")) s_msg_interval  = s_web.arg("miv").toInt();
@@ -935,7 +1160,7 @@ static void handle_send_msg() {
         strncpy(msg, s_web.arg("msg").c_str(), MSG_LEN - 1);
         msg[MSG_LEN - 1] = 0;
         for (char *c = msg; *c; c++)
-            if ((uint8_t)*c < 32 || (uint8_t)*c > 126) *c = '?';
+            if ((uint8_t)*c < 32 && *c != '\t') *c = ' '; // strip ctrl chars; UTF-8 high bytes pass through
         // jump the queue — start scrolling immediately
         s_active = false;
         s_cur_repeats = 0;
@@ -1082,6 +1307,10 @@ void loop() {
                 start_scroll(s_cur_msg);
             } else {
                 s_cur_repeats = 0;
+                if (s_idle_mode == 3 && s_hourly_msg[0])
+                    start_scroll(s_hourly_msg);
+                else
+                    update_idle_animation();
             }
         }
     }
