@@ -17,7 +17,7 @@
 // ============================================================
 #define LOG_PORT     4210
 #define LOG_LINES    48
-#define LOG_LINE_LEN 120
+#define LOG_LINE_LEN 256
 static WiFiUDP s_log_udp;
 static char    s_log_buf[LOG_LINES][LOG_LINE_LEN];
 static int     s_log_tail  = 0;
@@ -68,7 +68,7 @@ static uint8_t  s_led_r          = 0;
 static uint8_t  s_led_g          = 200;
 static uint8_t  s_led_b          = 0;
 static int8_t   s_utc_offset     = 0;
-static char     s_hourly_msg[128] = {};
+static char     s_hourly_msg[256] = {};
 static uint8_t  s_msg_interval   = 60;   // minutes between custom message (0 = off)
 static uint8_t  s_date_interval  = 10;   // minutes between date display  (0 = off)
 
@@ -145,13 +145,13 @@ static uint16_t XY(int x, int y) {
 // ============================================================
 // Scrolling text
 // ============================================================
-#define SCROLL_BUF_COLS 640
+#define SCROLL_BUF_COLS 1600
 static uint8_t  s_buf[SCROLL_BUF_COLS];
 static int      s_width      = 0;
 static int      s_pos        = 0;
 static uint32_t s_last_ms    = 0;
 static bool     s_active     = false;
-static char     s_cur_msg[128] = {};  // 128 == MSG_LEN (defined later)
+static char     s_cur_msg[256] = {};  // 256 == MSG_LEN (defined later)
 static int      s_cur_repeats  = 0;
 
 static int render_text(const char *text, uint8_t *buf, int max_cols) {
@@ -223,7 +223,7 @@ static void cache_node(uint32_t id, const char *name) {
 // Message queue
 // ============================================================
 #define MSG_Q   4
-#define MSG_LEN 128
+#define MSG_LEN 256
 static char s_q[MSG_Q][MSG_LEN];
 static int  s_qhead = 0, s_qtail = 0;
 
