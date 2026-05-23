@@ -359,6 +359,12 @@ Check the **UTC offset** in Settings. The device only shows the clock after NTP 
 
 Some devices are pickier than others. If the "sign in to network" prompt doesn't appear after connecting to the `sign` AP, just open a browser and go to `http://192.168.4.1` directly. Any URL you type will redirect there — the DNS server resolves everything to the AP address.
 
+**Long messages get cut off mid-sentence**
+
+Turns out if you size your message buffer for "most messages" and then someone sends a multi-part weather forecast, the display just stops mid-word and moves on like nothing happened. Meshtastic text payloads can be up to 228 bytes, and once you tack on the node prefix (`!XXXXXXXX: `) you're pushing 240 characters. The original buffer was 128. Oops.
+
+`MSG_LEN`, `SCROLL_BUF_COLS`, and `LOG_LINE_LEN` are all sized generously now (256, 1600, and 256 respectively), which comfortably handles the longest message the protocol can throw at it. If you built from an older copy of the code, pull and reflash.
+
 **Messages show up as `?????`**
 
 Your mesh is using a custom channel key instead of the default. You'll need to replace the 16 bytes in `MESH_KEY[]` at the top of `src/main.cpp` with your channel's expanded AES key.
