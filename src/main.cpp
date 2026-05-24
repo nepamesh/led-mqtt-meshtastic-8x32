@@ -814,12 +814,17 @@ static void wifi_start() {
     ulog("AP: sign / %s\n", WiFi.softAPIP().toString().c_str());
 }
 
+static uint32_t s_wifi_retry_ms = 0;
+
 static void wifi_check() {
     if (s_ap_mode) return;
-    if (WiFi.status() == WL_DISCONNECTED) {
-        ulog("WiFi lost, reconnecting\n");
-        WiFi.begin(s_wifi_ssid, s_wifi_pass);
-    }
+    if (WiFi.status() == WL_CONNECTED) return;
+    if (millis() - s_wifi_retry_ms < 10000) return;
+    s_wifi_retry_ms = millis();
+    ulog("WiFi lost (status=%d), reconnecting\n", WiFi.status());
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.begin(s_wifi_ssid, s_wifi_pass);
 }
 
 static uint32_t s_mqtt_retry_ms    = 0;
