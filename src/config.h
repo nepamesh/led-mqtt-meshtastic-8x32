@@ -1,14 +1,14 @@
 #pragma once
 
 // ---------- WiFi ----------
-#define WIFI_SSID       "Ragnarok"
-#define WIFI_PASS       "wherethehellaremypants"
+#define WIFI_SSID       "YourNetworkName"
+#define WIFI_PASS       "YourPassword"
 
 // ---------- NEPAMesh MQTT ----------
 #define MQTT_HOST       "107.172.196.126"   // mqtt.nepamesh.com
 #define MQTT_PORT       1883
 #define MQTT_USER       "sign"
-#define MQTT_PASS_STR   "832ballsack"
+#define MQTT_PASS_STR   "yourpassword"
 #define MQTT_TOPIC      "msh/US/2/e/LongFast/#"
 
 // ---------- WS2812B 8x32 Panel ----------

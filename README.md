@@ -216,21 +216,23 @@ First you'll see the boot test run — red, blue, green snake across all 256 LED
 Then it connects and prints its IP address. You'll see this in the serial monitor (115200 baud) or in the UDP log (see below):
 
 ```
-WiFi YourNetwork ... 192.168.x.x
-Web: http://192.168.x.x
-[DNS] mqtt.nepamesh.com -> 107.172.196.126
-MQTT OK
-SUB msh/US/2/e/LongFast/# -> OK
-[CLK] NTP synced (UTC ...)
-[CLK] show 10:30
+[+2s] WiFi YourNetwork ... 192.168.x.x
+[+2s] Web: http://192.168.x.x
+[+3s] [DNS] mqtt.nepamesh.com -> 107.172.196.126
+[+3s] MQTT OK
+[+3s] SUB msh/US/2/e/LongFast/# -> OK
+[10:32:04] [CLK] NTP synced (UTC ...)
+[10:32:04] [CLK] show 10:32
 ```
+
+Log lines are prefixed with a UTC wall-clock timestamp once NTP has synced (`[HH:MM:SS]`), and with uptime in seconds before that (`[+Xs]`). This makes it straightforward to correlate events — particularly useful when diagnosing MQTT drops that occur after a period of normal operation.
 
 When mesh traffic arrives:
 
 ```
-[MQTT] from=!A1B2C3D4 portnum=1 payload_len=12
-[MSG] enqueued: W3XYZ: Hello from the mesh
-[DISP] scroll: W3XYZ: Hello from the mesh
+[10:35:12] [MQTT] from=!A1B2C3D4 portnum=1 payload_len=12
+[10:35:12] [MSG] enqueued: W3XYZ: Hello from the mesh
+[10:35:12] [DISP] scroll: W3XYZ: Hello from the mesh
 ```
 
 The panel will start scrolling. If you only see `!XXXX` instead of a callsign, that's normal — it learns short names from NodeInfo packets as nodes check in. Give it a few minutes of traffic.
@@ -241,7 +243,7 @@ Telemetry and position packets (portnum ≠ 1) are silently dropped — they nev
 
 # Clock Display
 
-When the **Idle display** setting is set to **Clock** (the default), the panel shows a live clock in **H:MM** format whenever no messages are scrolling. The time is synced automatically via NTP on startup — no configuration required beyond setting the correct UTC offset.
+When no mesh messages are scrolling, the panel shows a live clock in **H:MM** format. The time is synced automatically via NTP (Google's time servers) on startup — no configuration required beyond setting the correct UTC offset.
 
 The clock updates every minute. As soon as a message finishes scrolling the clock reappears immediately — it doesn't wait for the next minute to tick over.
 
@@ -278,58 +280,6 @@ The date display is skipped at any minute when the custom message is also schedu
 
 ---
 
-# Idle Animations
-
-The **Idle display** dropdown (Settings → Display) controls what the panel does when it's waiting between messages. Incoming MQTT messages, date scrolls, and hourly messages always interrupt the idle animation and resume it when they finish.
-
-| Option | What it does |
-|--------|-------------|
-| **Clock** | Shows the time in H:MM format *(default)* |
-| **Fire** | Heat-diffusion fire animation rising from the bottom edge |
-| **Matrix Rain** | Falling green drops with bright heads and fading trails |
-| **Scroll message (loop)** | Continuously re-scrolls whatever is in the **Custom message** field |
-| **Twinkle** | Random pixels spawn at full brightness and fade through shifting colors |
-| **Off** | Panel goes dark between messages |
-
-**Fire orientation:** the flames rise from logical row 7 toward row 0. If they come out upside-down on your panel, toggle **Flip Y** in Display settings.
-
-**Scroll message (loop):** set your Custom message to whatever you want on permanent rotation — a callsign, a URL, a status line — and this mode will keep scrolling it until a real mesh message arrives and takes priority.
-
----
-
-# Emoji Rendering
-
-Meshtastic users love to pepper their messages with emoji. The display renders 38 common ones in their correct colors as 5×7 pixel art glyphs, inline with the rest of the scrolling text:
-
-| Category | Emoji |
-|----------|-------|
-| Hearts | ❤️ 🧡 💛 💚 💙 💜 |
-| Faces | 😊 ☺️ 😂 😢 😠 |
-| Nature | 🔥 ☀️ 🌧️ |
-| Symbols | ⭐ 🌟 ⚠️ ✅ ❌ 💯 📍 🎉 |
-| Hands | 👍 👎 👋 🙏 |
-| Circles | 🔴 🟠 🟡 🟢 🔵 🟣 |
-| Radio/mesh | 📡 📻 🔋 |
-| Alerts | 🆘 🛑 |
-| Other | 🌡️ |
-
-Unrecognized emoji are silently skipped rather than rendering as a box or `?`. Variation selectors and zero-width joiners are stripped harmlessly.
-
----
-
-# Text Effects
-
-The **Text effect** dropdown (Settings → Display) adds color effects to scrolling text. The effect applies at render time, so it works with both ASCII text and emoji.
-
-| Effect | Description |
-|--------|-------------|
-| **None** | Solid color chosen by the Text color picker |
-| **Rainbow** | Hue varies across the length of the message — left to right |
-| **Cycle** | Same hue spread as Rainbow, but the whole thing slowly rotates over time |
-| **Gradient** | Text color fades to a second color (set with the **Gradient end color** picker) across the message |
-
----
-
 # Web Interface
 
 Once the device is on your network, open `http://<device-ip>` in any browser. The interface matches the NEPAMesh color scheme — dark terminal background with green text.
@@ -344,7 +294,7 @@ Below that, change any of these without recompiling or reflashing:
 |---------|--------|
 | **WiFi** | SSID, Password |
 | **MQTT** | Host (IP or hostname), Port, User, Password, Subscription topic |
-| **Display** | Connector side, Flip Y, Brightness, Scroll speed (ms), Message repeat count, Text color, Text effect, Gradient end color, Idle display |
+| **Display** | Connector side, Flip Y, Brightness, Scroll speed (ms), Message repeat count, Text color |
 | **Clock** | UTC offset, Custom message, Custom message interval (min), Date display interval (min) |
 
 Hit **Save & Restart** and the device reboots with the new settings stored in flash. They survive power cycles.
@@ -353,41 +303,31 @@ The **MQTT Host** field accepts either an IP address (`107.172.196.126`) or a ho
 
 **Text color** uses a standard color picker — choose any color for the scrolling text. Default is green. Very dark colors may be hard to read at lower brightness levels.
 
-**Text effect** adds Rainbow, Cycle, or Gradient coloring to scrolling text. See the Text Effects section for details.
-
-**Idle display** selects what the panel shows between messages. See the Idle Animations section for details.
-
-![Settings page](screenshots/settings_full.png)
+![Settings page](screenshots/settings.png)
 
 ### Log (`/log`)
 
 Live scrolling debug output — the same stream you'd see over serial or UDP. Useful for confirming MQTT is connected, watching packets arrive, and diagnosing issues without plugging anything in.
 
 ```
-[DNS] mqtt.nepamesh.com -> 107.172.196.126
-MQTT OK
-SUB msh/US/2/e/LongFast/# -> OK
-[CLK] NTP synced (UTC 1748000000)
-[CLK] show 10:30
-[MQTT] from=!43B6DD10 portnum=1 payload_len=12
-[MSG] enqueued: W3NEP: Hello from the mesh
-[DISP] scroll: W3NEP: Hello from the mesh
-[CLK] date: May 21, 2026
+[+3s] [DNS] mqtt.nepamesh.com -> 107.172.196.126
+[+3s] MQTT OK
+[+3s] SUB msh/US/2/e/LongFast/# -> OK
+[10:32:04] [CLK] NTP synced (UTC 1748000000)
+[10:32:04] [CLK] show 10:32
+[10:35:12] [MQTT] from=!43B6DD10 portnum=1 payload_len=12
+[10:35:12] [MSG] enqueued: W3NEP: Hello from the mesh
+[10:35:12] [DISP] scroll: W3NEP: Hello from the mesh
+[10:40:00] [CLK] date: May 21, 2026
 ```
 
-![Log page](screenshots/log_full.png)
+![Log page](screenshots/log.png)
 
 ### OTA (`/ota`)
 
 Upload a new `.bin` firmware file directly from your browser — no USB cable needed. Build the firmware with PlatformIO, browse to `.pio/build/esp32c6/firmware.bin`, and upload. The device reboots into the new firmware automatically.
 
-You can also upload from the command line without touching a browser:
-
-```bash
-curl -F "f=@.pio/build/esp32c6/firmware.bin" http://<device-ip>/ota
-```
-
-![OTA page](screenshots/ota_full.png)
+![OTA page](screenshots/ota.png)
 
 ### UDP log monitor
 
@@ -437,11 +377,11 @@ Short names are learned passively from traffic. Ask someone to trigger a NodeInf
 
 **MQTT hostname not resolving**
 
-The firmware uses Google DNS (8.8.8.8) directly for hostname resolution, bypassing the router's DNS. If you see `[DNS] hostname -> 0.0.0.0` in the log, confirm the hostname exists by pinging it from another machine. IP addresses always work as an alternative.
+The firmware uses Google DNS (8.8.8.8) directly for hostname resolution, bypassing the router's DNS. It retries up to three times (2 s apart) in case the modem or router isn't fully online yet at boot — handy after a power outage. If all three attempts fail, it falls back to the last successfully resolved IP stored in flash, so a reboot during a brief outage won't leave the device permanently disconnected. If you see `[DNS] FAILED, no cache` in the log on a fresh device, confirm the hostname exists by pinging it from another machine. IP addresses always work as an alternative.
 
 **MQTT keeps disconnecting**
 
-The firmware generates a unique client ID from the ESP32's chip ID, so you won't collide with other devices. If it still disconnects, check your WiFi signal strength first — weak signal is the usual culprit.
+The firmware generates a unique client ID from the ESP32's chip ID, so you won't collide with other devices. If it still disconnects, check your WiFi signal strength first — weak signal is the usual culprit. If the connection drops and can't re-establish (state -2 in the log), the firmware automatically re-resolves the hostname after roughly 60 seconds of consecutive failures — this recovers the device if DNS returned a stale result at boot while the modem was still coming back online.
 
 **Panel flickers or shows wrong colors**
 
@@ -465,7 +405,6 @@ led-mqtt-meshtastic-8x32/
 └── src/
     ├── config.h          Your settings live here  ← edit this
     ├── font5x7.h         5×7 pixel font for the display (ASCII 32–126)
-    ├── emoji.h           38 hand-crafted 5×7 emoji glyphs with correct colors
     └── main.cpp          Everything else
 ```
 

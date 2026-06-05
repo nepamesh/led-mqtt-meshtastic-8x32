@@ -25,11 +25,25 @@ static int     s_log_tail  = 0;
 static int     s_log_count = 0;
 
 static void ulog(const char *fmt, ...) {
-    char buf[256];
+    char msg[244];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+
+    // Prepend UTC wall-clock time once NTP synced, else uptime
+    char ts[16];
+    time_t now; time(&now);
+    if (now >= 1000000000UL) {
+        struct tm t; gmtime_r(&now, &t);
+        snprintf(ts, sizeof(ts), "[%02d:%02d:%02d] ", t.tm_hour, t.tm_min, t.tm_sec);
+    } else {
+        snprintf(ts, sizeof(ts), "[+%us] ", (unsigned)(millis() / 1000));
+    }
+
+    char buf[LOG_LINE_LEN];
+    snprintf(buf, sizeof(buf), "%s%s", ts, msg);
+
     Serial.print(buf);
     // ring buffer (strip trailing newline)
     char line[LOG_LINE_LEN];
@@ -729,68 +743,76 @@ static DNSServer    s_dns;
 
 // DNS resolution direct to 8.8.8.8 — bypasses whatever the ESP32's resolver does
 static bool simple_dns_resolve(const char *hostname, IPAddress &result) {
-    WiFiUDP udp;
-    if (!udp.begin(5354)) return false;
-
-    uint8_t pkt[64] = {};
-    int pos = 0;
-    pkt[pos++] = 0xAB; pkt[pos++] = 0xCD;  // transaction id
-    pkt[pos++] = 0x01; pkt[pos++] = 0x00;  // standard query, RD=1
-    pkt[pos++] = 0x00; pkt[pos++] = 0x01;  // QDCOUNT=1
-    pos += 6;                               // ANCOUNT/NSCOUNT/ARCOUNT=0
-    // encode hostname as length-prefixed labels
-    char tmp[64]; strncpy(tmp, hostname, sizeof(tmp)-1); tmp[63] = 0;
-    char *p = tmp;
-    while (*p) {
-        char *dot = strchr(p, '.');
-        uint8_t len = dot ? (dot - p) : (uint8_t)strlen(p);
-        pkt[pos++] = len; memcpy(pkt + pos, p, len); pos += len;
-        if (!dot) break;
-        p = dot + 1;
-    }
-    pkt[pos++] = 0;                         // name terminator
-    pkt[pos++] = 0x00; pkt[pos++] = 0x01;  // QTYPE=A
-    pkt[pos++] = 0x00; pkt[pos++] = 0x01;  // QCLASS=IN
-
-    udp.beginPacket(IPAddress(8, 8, 8, 8), 53);
-    udp.write(pkt, pos);
-    udp.endPacket();
-
-    uint32_t t0 = millis();
-    while (millis() - t0 < 4000) {
-        int len = udp.parsePacket();
-        if (len >= 12) {
-            uint8_t resp[512]; int rlen = udp.read(resp, sizeof(resp));
-            if (resp[0] != 0xAB || resp[1] != 0xCD) { delay(5); continue; }
-            uint16_t ancount = ((uint16_t)resp[6] << 8) | resp[7];
-            if (ancount == 0) { udp.stop(); return false; }
-            // skip header + question
-            int idx = 12;
-            while (idx < rlen) {
-                if ((resp[idx] & 0xC0) == 0xC0) { idx += 2; break; }
-                if (resp[idx] == 0) { idx++; break; }
-                idx += 1 + resp[idx];
-            }
-            idx += 4; // QTYPE+QCLASS
-            // parse answers
-            for (uint16_t i = 0; i < ancount && idx + 10 <= rlen; i++) {
-                if ((resp[idx] & 0xC0) == 0xC0) idx += 2;
-                else { while (idx < rlen && resp[idx]) idx += 1 + resp[idx]; idx++; }
-                uint16_t rtype = ((uint16_t)resp[idx]<<8)|resp[idx+1]; idx += 2;
-                uint16_t rcls  = ((uint16_t)resp[idx]<<8)|resp[idx+1]; idx += 2;
-                idx += 4; // TTL
-                uint16_t rdlen = ((uint16_t)resp[idx]<<8)|resp[idx+1]; idx += 2;
-                if (rtype == 1 && rcls == 1 && rdlen == 4 && idx + 4 <= rlen) {
-                    result = IPAddress(resp[idx], resp[idx+1], resp[idx+2], resp[idx+3]);
-                    udp.stop(); return true;
-                }
-                idx += rdlen;
-            }
-            udp.stop(); return false;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            ulog("[DNS] retry %d\n", attempt);
+            delay(2000);
         }
-        delay(10);
+
+        WiFiUDP udp;
+        if (!udp.begin(5354)) continue;
+
+        uint8_t pkt[64] = {};
+        int pos = 0;
+        pkt[pos++] = 0xAB; pkt[pos++] = 0xCD;  // transaction id
+        pkt[pos++] = 0x01; pkt[pos++] = 0x00;  // standard query, RD=1
+        pkt[pos++] = 0x00; pkt[pos++] = 0x01;  // QDCOUNT=1
+        pos += 6;                               // ANCOUNT/NSCOUNT/ARCOUNT=0
+        char tmp[64]; strncpy(tmp, hostname, sizeof(tmp)-1); tmp[63] = 0;
+        char *p = tmp;
+        while (*p) {
+            char *dot = strchr(p, '.');
+            uint8_t len = dot ? (dot - p) : (uint8_t)strlen(p);
+            pkt[pos++] = len; memcpy(pkt + pos, p, len); pos += len;
+            if (!dot) break;
+            p = dot + 1;
+        }
+        pkt[pos++] = 0;                         // name terminator
+        pkt[pos++] = 0x00; pkt[pos++] = 0x01;  // QTYPE=A
+        pkt[pos++] = 0x00; pkt[pos++] = 0x01;  // QCLASS=IN
+
+        udp.beginPacket(IPAddress(8, 8, 8, 8), 53);
+        udp.write(pkt, pos);
+        udp.endPacket();
+
+        bool done = false;
+        uint32_t t0 = millis();
+        while (!done && millis() - t0 < 4000) {
+            int len = udp.parsePacket();
+            if (len >= 12) {
+                uint8_t resp[512]; int rlen = udp.read(resp, sizeof(resp));
+                if (resp[0] != 0xAB || resp[1] != 0xCD) { delay(5); continue; }
+                uint16_t ancount = ((uint16_t)resp[6] << 8) | resp[7];
+                if (ancount == 0) { done = true; break; }  // NXDOMAIN
+                // skip header + question
+                int idx = 12;
+                while (idx < rlen) {
+                    if ((resp[idx] & 0xC0) == 0xC0) { idx += 2; break; }
+                    if (resp[idx] == 0) { idx++; break; }
+                    idx += 1 + resp[idx];
+                }
+                idx += 4; // QTYPE+QCLASS
+                // parse answers
+                for (uint16_t i = 0; i < ancount && idx + 10 <= rlen; i++) {
+                    if ((resp[idx] & 0xC0) == 0xC0) idx += 2;
+                    else { while (idx < rlen && resp[idx]) idx += 1 + resp[idx]; idx++; }
+                    uint16_t rtype = ((uint16_t)resp[idx]<<8)|resp[idx+1]; idx += 2;
+                    uint16_t rcls  = ((uint16_t)resp[idx]<<8)|resp[idx+1]; idx += 2;
+                    idx += 4; // TTL
+                    uint16_t rdlen = ((uint16_t)resp[idx]<<8)|resp[idx+1]; idx += 2;
+                    if (rtype == 1 && rcls == 1 && rdlen == 4 && idx + 4 <= rlen) {
+                        result = IPAddress(resp[idx], resp[idx+1], resp[idx+2], resp[idx+3]);
+                        udp.stop(); return true;
+                    }
+                    idx += rdlen;
+                }
+                done = true;
+            }
+            delay(10);
+        }
+        udp.stop();
     }
-    udp.stop(); return false;
+    return false;
 }
 
 static void wifi_start() {
@@ -829,6 +851,39 @@ static void wifi_check() {
 
 static uint32_t s_mqtt_retry_ms    = 0;
 static bool     s_mqtt_was_connected = false;
+static uint8_t  s_mqtt_fail_count   = 0;
+
+// Resolve s_mqtt_host (hostname or IP literal) and call s_mqtt.setServer().
+// On successful DNS resolve, caches the IP in NVS so a future boot can
+// fall back to the cached IP if the modem isn't ready yet.
+static void mqtt_resolve_and_set() {
+    int a, b, c, d;
+    if (sscanf(s_mqtt_host, "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
+        s_mqtt.setServer(IPAddress(a, b, c, d), s_mqtt_port);
+        return;
+    }
+    IPAddress resolved;
+    if (simple_dns_resolve(s_mqtt_host, resolved)) {
+        ulog("[DNS] %s -> %s\n", s_mqtt_host, resolved.toString().c_str());
+        s_prefs.begin("nepamesh", false);
+        s_prefs.putString("dns_ip", resolved.toString().c_str());
+        s_prefs.end();
+        s_mqtt.setServer(resolved, s_mqtt_port);
+        return;
+    }
+    // DNS failed — try NVS-cached IP from last successful resolve
+    char cached[16] = {};
+    s_prefs.begin("nepamesh", true);
+    s_prefs.getString("dns_ip", cached, sizeof(cached));
+    s_prefs.end();
+    if (cached[0] && sscanf(cached, "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
+        ulog("[DNS] FAILED, using cached IP %s\n", cached);
+        s_mqtt.setServer(IPAddress(a, b, c, d), s_mqtt_port);
+        return;
+    }
+    ulog("[DNS] FAILED, no cache, trying hostname\n");
+    s_mqtt.setServer(s_mqtt_host, s_mqtt_port);
+}
 
 static void mqtt_check() {
     if (s_ap_mode) return;
@@ -845,10 +900,23 @@ static void mqtt_check() {
     ulog("MQTT connecting...\n");
     if (s_mqtt.connect(cid, s_mqtt_user, s_mqtt_pass)) {
         ulog("MQTT OK\n");
+        s_mqtt_fail_count = 0;
         bool sub = s_mqtt.subscribe(s_mqtt_topic);
         ulog("SUB %s -> %s\n", s_mqtt_topic, sub ? "OK" : "FAIL");
     } else {
-        ulog("MQTT err %d\n", s_mqtt.state());
+        int state = s_mqtt.state();
+        ulog("MQTT err %d\n", state);
+        // After 12 consecutive TCP failures (~1 min) on a hostname, re-resolve.
+        // Recovers if DNS was stale at boot (e.g. modem not ready after power outage).
+        int a, b, c, d;
+        bool is_hostname = sscanf(s_mqtt_host, "%d.%d.%d.%d", &a, &b, &c, &d) != 4;
+        if (state == MQTT_CONNECT_FAILED && is_hostname && ++s_mqtt_fail_count >= 12) {
+            s_mqtt_fail_count = 0;
+            ulog("[DNS] re-resolving after repeated connect failures\n");
+            mqtt_resolve_and_set();
+        } else if (state != MQTT_CONNECT_FAILED) {
+            s_mqtt_fail_count = 0;
+        }
     }
 }
 
@@ -896,8 +964,33 @@ static void ntp_poll() {
 // ============================================================
 static WebServer s_web(80);
 
-static void web_send_head(const char *title) {
-    s_web.sendContent(
+// Page buffer — assembled then sent as one HTTP response (no chunked encoding)
+static char   s_page_buf[6144];
+static size_t s_page_pos;
+
+static void page_start() { s_page_pos = 0; }
+
+static void page_puts(const char *s) {
+    size_t rem = sizeof(s_page_buf) - s_page_pos - 1;
+    size_t n   = strnlen(s, rem);
+    memcpy(s_page_buf + s_page_pos, s, n);
+    s_page_pos += n;
+    s_page_buf[s_page_pos] = 0;
+}
+
+static void page_fmt(const char *fmt, ...) {
+    if (s_page_pos >= sizeof(s_page_buf) - 1) return;
+    size_t rem = sizeof(s_page_buf) - s_page_pos;
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(s_page_buf + s_page_pos, rem, fmt, ap);
+    va_end(ap);
+    if (n > 0) s_page_pos += (n < (int)rem) ? (size_t)n : rem - 1;
+}
+
+static void page_send() { s_web.send(200, "text/html", s_page_buf); }
+
+static void page_head() {
+    page_puts(
         "<!DOCTYPE html><html><head>"
         "<meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -905,32 +998,23 @@ static void web_send_head(const char *title) {
         "<style>"
         "body{font-family:'Courier New',monospace;max-width:540px;margin:0 auto;"
         "padding:16px 12px;background:#0a0a0a;color:#33ff33}"
-    );
-    s_web.sendContent(
         ".logo{text-align:center;margin-bottom:12px}"
         ".logo img{height:72px;width:auto}"
         "h1{font-size:1.3em;color:#44ff44;margin:0 0 2px;text-align:center;"
-        "letter-spacing:3px;text-transform:uppercase;"
-        "text-shadow:0 0 8px #33ff33}"
+        "letter-spacing:3px;text-transform:uppercase;text-shadow:0 0 8px #33ff33}"
         ".sub{text-align:center;font-size:.75em;color:#44dd44;letter-spacing:2px;"
         "margin-bottom:12px}"
-    );
-    s_web.sendContent(
         "h2{font-size:.85em;color:#44ff44;margin:0 0 8px;letter-spacing:2px;"
         "text-transform:uppercase;border-bottom:1px solid #1a3a1a;padding-bottom:4px}"
         ".s{background:#111;padding:12px;margin:10px 0;border-radius:4px;"
         "border:1px solid #1a3a1a}"
         ".send{border-color:#224422}"
         "label{display:block;margin-top:8px;font-size:.8em;color:#66ff66}"
-    );
-    s_web.sendContent(
         "input,select{width:100%;padding:6px;box-sizing:border-box;margin-top:3px;"
         "background:#0a0a0a;color:#33ff33;border:1px solid #224422;border-radius:3px;"
         "font-family:'Courier New',monospace;font-size:.9em}"
         "input:focus,select:focus{outline:none;border-color:#33ff33}"
         "input[type='color']{height:32px;padding:2px}"
-    );
-    s_web.sendContent(
         "button{margin-top:14px;padding:10px 24px;background:#1a3a1a;color:#33ff33;"
         "border:1px solid #33ff33;border-radius:4px;cursor:pointer;font-size:.9em;"
         "font-family:'Courier New',monospace;letter-spacing:2px;text-transform:uppercase}"
@@ -940,8 +1024,6 @@ static void web_send_head(const char *title) {
         "nav a{margin:0 10px;color:#44dd44;text-decoration:none;font-size:.8em;"
         "letter-spacing:2px;text-transform:uppercase}"
         "nav a:hover{color:#66ff66}"
-    );
-    s_web.sendContent(
         "#lb{font-family:'Courier New',monospace;background:#000;color:#33ff33;"
         "padding:10px;height:360px;overflow-y:auto;white-space:pre-wrap;font-size:.8em;"
         "border:1px solid #1a3a1a;border-radius:4px}"
@@ -954,99 +1036,99 @@ static void web_send_head(const char *title) {
         "<div class='sub'>LED Matrix Display</div>"
         "<nav><a href='/'>Settings</a><a href='/log'>Log</a><a href='/ota'>OTA</a></nav>"
     );
-    (void)title;
-}
-
-static void sf(const char *fmt, ...) {
-    char buf[512];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    s_web.sendContent(buf);
 }
 
 static void handle_root() {
-    s_web.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    s_web.send(200, "text/html", "");
-    web_send_head("Settings");
+    page_start();
+    page_head();
 
-    // Direct message send
-    s_web.sendContent("<div class='s send'><h2>&#9654; Send Message</h2>"
+    page_puts(
+        "<div class='s send'><h2>&#9654; Send Message</h2>"
         "<form method='POST' action='/sendmsg'>"
         "<label>Message<input name='msg' placeholder='Text to display on screen'></label>"
         "<button type='submit'>Send to Screen</button>"
-        "</form></div>");
+        "</form></div>"
+        "<form method='POST' action='/save'>"
+    );
 
-    s_web.sendContent("<form method='POST' action='/save'>");
+    page_fmt(
+        "<div class='s'><h2>WiFi</h2>"
+        "<label>SSID<input name='ws' value='%s'></label>"
+        "<label>Password<input name='wp' type='password' value='%s'></label>"
+        "</div>",
+        s_wifi_ssid, s_wifi_pass
+    );
 
-    // WiFi
-    s_web.sendContent("<div class='s'><h2>WiFi</h2>");
-    sf("<label>SSID<input name='ws' value='%s'></label>", s_wifi_ssid);
-    sf("<label>Password<input name='wp' type='password' value='%s'></label>", s_wifi_pass);
-    s_web.sendContent("</div>");
+    page_fmt(
+        "<div class='s'><h2>MQTT</h2>"
+        "<label>Host (IP or hostname)<input name='mh' value='%s'></label>"
+        "<label>Port<input name='mp' type='number' value='%u'></label>"
+        "<label>User<input name='mu' value='%s'></label>"
+        "<label>Password<input name='mpw' type='password' value='%s'></label>"
+        "<label>Subscription topic<input name='mt' value='%s'></label>"
+        "</div>",
+        s_mqtt_host, s_mqtt_port, s_mqtt_user, s_mqtt_pass, s_mqtt_topic
+    );
 
-    // MQTT
-    s_web.sendContent("<div class='s'><h2>MQTT</h2>");
-    sf("<label>Host (IP or hostname)<input name='mh' value='%s'></label>", s_mqtt_host);
-    sf("<label>Port<input name='mp' type='number' value='%u'></label>", s_mqtt_port);
-    sf("<label>User<input name='mu' value='%s'></label>", s_mqtt_user);
-    sf("<label>Password<input name='mpw' type='password' value='%s'></label>", s_mqtt_pass);
-    sf("<label>Subscription topic<input name='mt' value='%s'></label>", s_mqtt_topic);
-    s_web.sendContent("</div>");
-
-    // Display
-    s_web.sendContent("<div class='s'><h2>Display</h2>");
-    sf("<label>Connector side<select name='cr'>"
-       "<option value='1'%s>Right</option><option value='0'%s>Left</option>"
-       "</select></label>",
-       s_conn_right ? " selected" : "", !s_conn_right ? " selected" : "");
-    sf("<label>Flip Y<select name='fy'>"
-       "<option value='0'%s>Normal</option><option value='1'%s>Flipped</option>"
-       "</select></label>",
-       !s_flip_y ? " selected" : "", s_flip_y ? " selected" : "");
-    sf("<label>Brightness (1-255)<input name='br' type='number' min='1' max='255' value='%u'></label>", s_brightness);
-    sf("<label>Scroll speed ms<input name='sm' type='number' min='10' max='500' value='%u'></label>", s_scroll_ms);
-    sf("<label>Message repeat count<input name='rc' type='number' min='1' max='10' value='%u'></label>", s_repeat_count);
-    char hex[8];
-    snprintf(hex, sizeof(hex), "#%02x%02x%02x", s_led_r, s_led_g, s_led_b);
-    sf("<label>Text color<input name='col' type='color' value='%s'></label>", hex);
-    sf("<label>Text effect<select name='fx'>"
-       "<option value='0'%s>None</option>"
-       "<option value='1'%s>Rainbow</option>"
-       "<option value='2'%s>Cycle</option>"
-       "<option value='3'%s>Gradient (text color → end color)</option>"
-       "</select></label>",
-       s_effect==0?" selected":"", s_effect==1?" selected":"",
-       s_effect==2?" selected":"", s_effect==3?" selected":"");
-    char hex2[8];
+    char hex[8], hex2[8];
+    snprintf(hex,  sizeof(hex),  "#%02x%02x%02x", s_led_r,  s_led_g,  s_led_b);
     snprintf(hex2, sizeof(hex2), "#%02x%02x%02x", s_grad_r, s_grad_g, s_grad_b);
-    sf("<label>Gradient end color<input name='gcol' type='color' value='%s'></label>", hex2);
-    sf("<label>Idle display<select name='im'>"
-       "<option value='0'%s>Clock</option>"
-       "<option value='1'%s>Fire</option>"
-       "<option value='2'%s>Matrix Rain</option>"
-       "<option value='3'%s>Scroll message (loop)</option>"
-       "<option value='4'%s>Twinkle</option>"
-       "<option value='5'%s>Off</option>"
-       "</select></label>",
-       s_idle_mode==0?" selected":"", s_idle_mode==1?" selected":"",
-       s_idle_mode==2?" selected":"", s_idle_mode==3?" selected":"",
-       s_idle_mode==4?" selected":"", s_idle_mode==5?" selected":"");
-    s_web.sendContent("</div>");
+    page_fmt(
+        "<div class='s'><h2>Display</h2>"
+        "<label>Connector side<select name='cr'>"
+        "<option value='1'%s>Right</option><option value='0'%s>Left</option>"
+        "</select></label>"
+        "<label>Flip Y<select name='fy'>"
+        "<option value='0'%s>Normal</option><option value='1'%s>Flipped</option>"
+        "</select></label>"
+        "<label>Brightness (1-255)<input name='br' type='number' min='1' max='255' value='%u'></label>"
+        "<label>Scroll speed ms<input name='sm' type='number' min='10' max='500' value='%u'></label>"
+        "<label>Message repeat count<input name='rc' type='number' min='1' max='10' value='%u'></label>"
+        "<label>Text color<input name='col' type='color' value='%s'></label>"
+        "<label>Text effect<select name='fx'>"
+        "<option value='0'%s>None</option>"
+        "<option value='1'%s>Rainbow</option>"
+        "<option value='2'%s>Cycle</option>"
+        "<option value='3'%s>Gradient (text to end color)</option>"
+        "</select></label>"
+        "<label>Gradient end color<input name='gcol' type='color' value='%s'></label>"
+        "<label>Idle display<select name='im'>"
+        "<option value='0'%s>Clock</option>"
+        "<option value='1'%s>Fire</option>"
+        "<option value='2'%s>Matrix Rain</option>"
+        "<option value='3'%s>Scroll message (loop)</option>"
+        "<option value='4'%s>Twinkle</option>"
+        "<option value='5'%s>Off</option>"
+        "</select></label>"
+        "</div>",
+        s_conn_right ? " selected" : "", !s_conn_right ? " selected" : "",
+        !s_flip_y ? " selected" : "", s_flip_y ? " selected" : "",
+        s_brightness, s_scroll_ms, s_repeat_count,
+        hex,
+        s_effect==0?" selected":"", s_effect==1?" selected":"",
+        s_effect==2?" selected":"", s_effect==3?" selected":"",
+        hex2,
+        s_idle_mode==0?" selected":"", s_idle_mode==1?" selected":"",
+        s_idle_mode==2?" selected":"", s_idle_mode==3?" selected":"",
+        s_idle_mode==4?" selected":"", s_idle_mode==5?" selected":""
+    );
 
-    // Clock
-    s_web.sendContent("<div class='s'><h2>Clock</h2>");
-    sf("<label>UTC offset (hours, e.g. -4 for EDT, -5 for EST)"
-       "<input name='tz' type='number' min='-12' max='14' value='%d'></label>", s_utc_offset);
-    sf("<label>Custom message (empty to disable)"
-       "<input name='hm' value='%s'></label>", s_hourly_msg);
-    sf("<label>Custom message interval (minutes, 0 to disable)"
-       "<input name='miv' type='number' min='0' max='60' value='%u'></label>", s_msg_interval);
-    sf("<label>Date display interval (minutes, 0 to disable)"
-       "<input name='div' type='number' min='0' max='60' value='%u'></label>", s_date_interval);
-    s_web.sendContent("</div>");
+    page_fmt(
+        "<div class='s'><h2>Clock</h2>"
+        "<label>UTC offset (hours, e.g. -4 for EDT, -5 for EST)"
+        "<input name='tz' type='number' min='-12' max='14' value='%d'></label>"
+        "<label>Custom message (empty to disable)"
+        "<input name='hm' value='%s'></label>"
+        "<label>Custom message interval (minutes, 0 to disable)"
+        "<input name='miv' type='number' min='0' max='60' value='%u'></label>"
+        "<label>Date display interval (minutes, 0 to disable)"
+        "<input name='div' type='number' min='0' max='60' value='%u'></label>"
+        "</div>",
+        s_utc_offset, s_hourly_msg, s_msg_interval, s_date_interval
+    );
 
-    s_web.sendContent("<button type='submit'>Save &amp; Restart</button></form></body></html>");
+    page_puts("<button type='submit'>Save &amp; Restart</button></form></body></html>");
+    page_send();
 }
 
 static void handle_save() {
@@ -1093,10 +1175,9 @@ static void handle_save() {
 }
 
 static void handle_log_page() {
-    s_web.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    s_web.send(200, "text/html", "");
-    web_send_head("Log");
-    s_web.sendContent(
+    page_start();
+    page_head();
+    page_puts(
         "<div id='lb'></div>"
         "<script>"
         "function r(){"
@@ -1107,7 +1188,9 @@ static void handle_log_page() {
         "})}"
         "r();setInterval(r,1000);"
         "</script>"
-        "</body></html>");
+        "</body></html>"
+    );
+    page_send();
 }
 
 static void handle_log_data() {
@@ -1132,16 +1215,17 @@ static void handle_log_data() {
 }
 
 static void handle_ota_page() {
-    s_web.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    s_web.send(200, "text/html", "");
-    web_send_head("OTA");
-    s_web.sendContent(
+    page_start();
+    page_head();
+    page_puts(
         "<div class='s'>"
         "<h2>Firmware Upload</h2>"
         "<form method='POST' action='/ota' enctype='multipart/form-data'>"
         "<input type='file' name='f' accept='.bin' style='margin-bottom:10px'><br>"
         "<button type='submit'>Upload &amp; Restart</button>"
-        "</form></div></body></html>");
+        "</form></div></body></html>"
+    );
+    page_send();
 }
 
 static void handle_ota_upload() {
@@ -1194,10 +1278,14 @@ static void setup_webserver() {
             ESP.restart();
         },
         handle_ota_upload);
-    // Captive portal — redirect all unrecognised URLs to settings page
+    // Captive portal in AP mode; 404 in STA mode
     s_web.onNotFound([]() {
-        s_web.sendHeader("Location", "http://192.168.4.1/");
-        s_web.send(302, "text/plain", "");
+        if (s_ap_mode) {
+            s_web.sendHeader("Location", "http://192.168.4.1/");
+            s_web.send(302, "text/plain", "");
+        } else {
+            s_web.send(404, "text/plain", "");
+        }
     });
     s_web.begin();
     if (s_ap_mode)
@@ -1255,21 +1343,9 @@ void setup() {
     setup_webserver();
 
     if (!s_ap_mode) {
-        s_wifi.setTimeout(5000);
+        s_wifi.setTimeout(500);
 
-        int a, b, c, d;
-        if (sscanf(s_mqtt_host, "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
-            s_mqtt.setServer(IPAddress(a, b, c, d), s_mqtt_port);
-        } else {
-            IPAddress resolved;
-            if (simple_dns_resolve(s_mqtt_host, resolved)) {
-                ulog("[DNS] %s -> %s\n", s_mqtt_host, resolved.toString().c_str());
-                s_mqtt.setServer(resolved, s_mqtt_port);
-            } else {
-                ulog("[DNS] FAILED to resolve %s, trying anyway\n", s_mqtt_host);
-                s_mqtt.setServer(s_mqtt_host, s_mqtt_port);
-            }
-        }
+        mqtt_resolve_and_set();
 
         s_mqtt.setKeepAlive(10);
         s_mqtt.setCallback(on_message);
@@ -1282,6 +1358,7 @@ void setup() {
 }
 
 void loop() {
+    s_web.handleClient();   // service HTTP first, before any potentially-blocking MQTT work
     if (s_ap_mode) {
         s_dns.processNextRequest();
     } else {
@@ -1291,7 +1368,6 @@ void loop() {
         s_mqtt.loop();
         ntp_poll();
     }
-    s_web.handleClient();
 
     static bool s_prev_active = false;
     update_display();
@@ -1319,4 +1395,5 @@ void loop() {
             }
         }
     }
+    delay(1);   // yield to FreeRTOS WiFi/TCP stack tasks
 }
